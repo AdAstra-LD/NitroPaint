@@ -1,0 +1,110 @@
+MSVCRT-LIGHT - A REPLACEMENT FOR THE MSVC STANDARD LIBRARY USING MSVCRT.DLL
+
+How and when to use these libraries:
+
+By default, the linker includes the C / C++ standard library.
+As a result, executable size is at least 40 KByte.
+Or you believe to be smart, switch to the DLL version (like msvcrp80.dll),
+but this will still bloat your EXE file by some kByte,
+and you have to distribute the DLL file too.
+
+By disabling the default library with /NOD or /NODEFAULTLIB switch,
+useful routines are missing, especially for float-point support.
+
+I assume that the user knows that entry points change to
+int CALLBACK WinMainCRTStartup(), int CALLBACK _mainCRTStartup(),
+and for a DLL to int CALLBACK _DllMainCRTStartup(HINSTANCE,DWORD,LPVOID).
+
+On each system, an MSVCRT.DLL file is preinstalled and available.
+This is the clue for these import libraries.
+
+If your program should run on every Win32 platform, use "msvcrt-light.lib"
+It has most limitations.
+So when you get a linker error, you have to feed the missing function or
+variable yourself, because it's simply not exported by every MSVCRT.DLL.
+
+If your program requires NT based platforms (typically as a Unicode executable),
+you can use "msvcrt-light-w2k.lib" with some more functions,
+but that's only useful when you have to feed at least one function name otherwise.
+
+Last but not least, if you compile for AMD64 platform (it was introduced with XP),
+you use the "msvcrt-light-x64.lib" import library.
+
+To inform MSVC to generate msvcrt library calls without stubs,
+ensure that you link to .DLL file in your project settings.
+This will define a "_DLL" preprocessor macro.
+
+All run-time checks must be disabled.
+Stack usage is limited to 4 KByte per function.
+Static constructors cannot be used.
+MSVCRT.DLL has no support for reading/writing UTF-8 files,
+ i.e. the "css=<encoding>" flag and BOM detection (see fopen()) will not work.
+
+
+Float-point support needs some extra work to compile&link properly:
+
+* Define a symbol _fltused somewhere, typically:
+** char _fltused;				// C
+** extern "C" char _fltused; char _fltused;	// C++
+** EXTERN_C char _fltused; char _fltused;	// both
+
+* Avoid typecasts to int and write your own function, and use the x87 built-in
+  rounding feature instead of the brain-dead (int)floor(x+0.5) construct:
+	__forceinline __int64 rndint64(double f) {
+	 __int64 i;
+	 _asm	fld	f
+	 _asm	fistp	i	// This rounds 0.5 to 0 and 1.5 to 2 (Banker's Rounding)
+	 return i;		// whereas floor(0.5+0.5) rounds to 1 (Kaufmännisches Runden)
+	}
+** It's possible to generate this sequence on each (int) cast
+   using the command-line option /QIfist, but this will make your source code
+   unreadable because the casts won't round towards zero.
+   And using _controlfp() will affect other operations.
+** For AMD64, you need an external assembler, like ml64 oder yasm:
+	rndint64:
+	 cvtpd2dq xmm0,xmm0
+	 movq	  rax,xmm0
+	 ret
+
+* Using intrinsic forms with command-line options /Oi, /Og, and /fp:fast
+  (all switches necessary, but /O1 includes /Og) avoids library calls
+  for some functions but that's not a requirement.
+
+
+<stdio> support (console applications) needs some extra work
+when using MSVC newer than version 6:
+	
+_CRTIMP FILE _iob[3];
+	
+#undef stdin
+	
+#define stdin (_iob+0)
+
+	
+#undef stdout
+	
+#define stdout (_iob+1)
+
+	
+#undef stderr
+	
+#define stderr (_iob+2)
+
+
+The structure for the runtime library was heavily changed with Visual Studio 2015.
+You usually get errors like "unresolved symbol __acrt_iob_func".
+Defining _NO_CRT_STDIO_INLINE reverts the headers to previous behaviour,
+so you should define it in your project settings.
+
+
+Good luck with your fat-reduced executables!
+
+
+Similar applies to "htmlhelp.lib" which directly imports from hhctrl.ocx
+and avoids dependencies to __security_check_cookie and other debugging symbols.
+
+To avoid creating stubs, change your "htmlhelp.h" file prepending
+_declspec(dllimport) in front of HWND WINAPI HtmlHelpA(...) resp. HtmlHelpW.
+The same applies to "hidpi.h" and "hidsdi.h" file, among some others.
+
+h#s
