@@ -1689,5 +1689,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 }
 
 int main(void) {
+	ShowWindow(GetConsoleWindow(), SW_HIDE);
 	return WinMain(GetModuleHandle(NULL), NULL, NULL, 0);
 }
