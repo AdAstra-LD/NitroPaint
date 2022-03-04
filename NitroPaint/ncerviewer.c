@@ -124,7 +124,7 @@ void UpdateControls(HWND hWnd) {
 	}
 	len = wsprintfW(buffer, L"%d", info.x >= 256 ? (info.x - 512) : info.x);
 	SendMessage(data->hWndXInput, WM_SETTEXT, len, (LPARAM) buffer);
-	len = wsprintfW(buffer, L"%d", info.y);
+	len = wsprintfW(buffer, L"%d", info.y >= 128 ? (info.y - 256) : info.y);
 	SendMessage(data->hWndYInput, WM_SETTEXT, len, (LPARAM) buffer);
 
 	int sizes[] = { 0, 0, 1, 0, 1, 2, 1, 2, 2, 3, 3, 3 };
@@ -277,7 +277,7 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			//|     | [Size: XxX]
 			//+-----+
 			//[Cell x]
-			data->hWndCellDropdown = CreateWindow(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 256, 132, 100, hWnd, NULL, NULL, NULL);
+			data->hWndCellDropdown = CreateWindow(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 256, 112, 100, hWnd, NULL, NULL, NULL);
 			data->hWndOamDropdown = CreateWindow(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST | WS_VSCROLL, 512, 0, 68, 100, hWnd, NULL, NULL, NULL);
 			CreateWindow(L"STATIC", L"Character: ", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 512, 21, 50, 21, hWnd, NULL, NULL, NULL);
 			data->hWndCharacterOffset = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 512 + 50, 21, 30, 21, hWnd, NULL, NULL, NULL);
@@ -303,8 +303,9 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 			data->hWndOamRemove = CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD, 580, 0, 16, 21, hWnd, NULL, NULL, NULL);
 			data->hWndOamAdd = CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD, 596, 0, 16, 21, hWnd, NULL, NULL, NULL);
-			data->hWndCellRemove = CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD, 132, 256, 16, 21, hWnd, NULL, NULL, NULL);
-			data->hWndCellAdd = CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD, 148, 256, 16, 21, hWnd, NULL, NULL, NULL);
+			data->hWndCellRemove = CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD, 112, 256, 16, 21, hWnd, NULL, NULL, NULL);
+			data->hWndCellAdd = CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD, 128, 256, 16, 21, hWnd, NULL, NULL, NULL);
+			data->hWndCellDuplicate = CreateWindow(L"BUTTON", L"D", WS_VISIBLE | WS_CHILD, 144, 256, 16, 21, hWnd, NULL, NULL, NULL);
 
 			data->hWndDoubleSize = CreateWindow(L"BUTTON", L"Double Size", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 512, 239 - 22, 100, 22, hWnd, NULL, NULL, NULL);
 			CreateWindow(L"STATIC", L"Priority:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 512, 261, 50, 21, hWnd, NULL, NULL, NULL);
@@ -844,6 +845,36 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 					UpdateOamDropdown(hWnd);
 					SendMessage(data->hWndCellDropdown, CB_ADDSTRING, 0, (LPARAM) name);
+					SendMessage(data->hWndCellDropdown, CB_SETCURSEL, data->cell, 0);
+					UpdateControls(hWnd);
+					InvalidateRect(hWnd, NULL, TRUE);
+					changed = 1;
+				} else if (notification == BN_CLICKED && hWndControl == data->hWndCellDuplicate) {
+					NCER* ncer = &data->ncer;
+					NCER_CELL* oldCell = ncer->cells + data->cell;
+
+					//add the cell
+					ncer->nCells++;
+					ncer->cells = realloc(ncer->cells, ncer->nCells * sizeof(NCER_CELL));
+					NCER_CELL* cell = ncer->cells + ncer->nCells - 1;
+					memset(cell, 0, sizeof(NCER_CELL));
+					cell->nAttribs = oldCell->nAttribs;
+					cell->cellAttr = oldCell->cellAttr;
+					cell->maxX = oldCell->maxX;
+					cell->maxY = oldCell->maxY;
+					cell->minX = oldCell->minX;
+					cell->minY = oldCell->minY;
+					cell->nAttr = oldCell->nAttr;
+					cell->attr = (WORD*)calloc(oldCell->nAttr, 6);
+					memcpy(cell->attr, oldCell->attr, oldCell->nAttr * 6);
+					data->cell = ncer->nCells - 1;
+					data->oam = 0;
+
+					WCHAR name[16];
+					wsprintfW(name, L"Cell %02d", data->cell);
+
+					UpdateOamDropdown(hWnd);
+					SendMessage(data->hWndCellDropdown, CB_ADDSTRING, 0, (LPARAM)name);
 					SendMessage(data->hWndCellDropdown, CB_SETCURSEL, data->cell, 0);
 					UpdateControls(hWnd);
 					InvalidateRect(hWnd, NULL, TRUE);

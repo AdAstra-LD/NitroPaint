@@ -46,6 +46,7 @@ typedef struct NCERVIEWERDATA_ {
 	HWND hWndOamRemove;
 	HWND hWndCellAdd;
 	HWND hWndCellRemove;
+	HWND hWndCellDuplicate;
 	HWND hWndSizeDropdown;
 	HWND hWndCellBoundsCheckbox;
 } NCERVIEWERDATA;
