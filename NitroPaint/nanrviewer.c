@@ -477,8 +477,8 @@ LRESULT CALLBACK NanrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 			data->hWndScaleY = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1.0000", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 632 + 110, 149 + 27, 50, 22, hWnd, NULL, NULL, NULL);
 			data->hWndRotateAngle = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 632 + 55, 149 + 27 + 27, 50, 22, hWnd, NULL, NULL, NULL);
 
-			data->hWndDeleteFrame = CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD, 522, 245 - 11, 50, 22, hWnd, NULL, NULL, NULL);
-			data->hWndAddFrame = CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD, 577, 245 - 11, 50, 22, hWnd, NULL, NULL, NULL);
+			data->hWndDeleteFrame = CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD, 522, 245 - 7, 50, 22, hWnd, NULL, NULL, NULL);
+			data->hWndAddFrame = CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD, 577, 245 - 7, 50, 22, hWnd, NULL, NULL, NULL);
 
 			setupWindowAnimationTick(hWnd);
 			break;
@@ -666,16 +666,19 @@ LRESULT CALLBACK NanrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
 					WCHAR bf[16];
 					SendMessage(hWndControl, WM_GETTEXT, 16, (LPARAM) bf);
 					int frameCount = _wtol(bf);
-
-					sequence->frames[startFrameIndex].nFrames = frameCount;
+					if (frameCount > 0) {
+						sequence->frames[startFrameIndex].nFrames = frameCount;
+					}
 				} else if (hWndControl == data->hWndIndex && notif == EN_CHANGE) {
 					WCHAR bf[16];
 					SendMessage(hWndControl, WM_GETTEXT, 16, (LPARAM) bf);
 					int index = _wtol(bf);
 
-					ANIM_DATA *f = (ANIM_DATA *) sequence->frames[startFrameIndex].animationData;
-					f->index = index;
-					InvalidateRect(hWnd, NULL, FALSE);
+					if (index > -1) {
+						ANIM_DATA* f = (ANIM_DATA*)sequence->frames[startFrameIndex].animationData;
+						f->index = index;
+						InvalidateRect(hWnd, NULL, FALSE);
+					}
 				} else if ((hWndControl == data->hWndTranslateX || hWndControl == data->hWndTranslateY) && notif == EN_CHANGE) {
 					WCHAR bf[16];
 					SendMessage(hWndControl, WM_GETTEXT, 16, (LPARAM) bf);
