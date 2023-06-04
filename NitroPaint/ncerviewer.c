@@ -32,11 +32,15 @@ VOID PaintNcerViewer(HWND hWnd) {
 	NCER_CELL *cell = data->ncer.cells + data->cell;
 	NCER_CELL_INFO info;
 	decodeAttributesEx(&info, cell, data->oam);
-	int width, height;
 
 	int translateX = 256 - (cell->maxX + cell->minX) / 2, translateY = 128 - (cell->maxY + cell->minY) / 2;
-	DWORD *bits = ncerRenderWholeCell(data->ncer.cells + data->cell, ncgr, nclr, 
-									  translateX, translateY, &width, &height, 1, data->oam);
+	memset(data->frameBuffer, 0, sizeof(data->frameBuffer));
+	NCER_VRAM_TRANSFER_ENTRY *transferEntry = NULL;
+	if (data->ncer.vramTransfer != NULL)
+		transferEntry = data->ncer.vramTransfer + data->cell;
+	DWORD *bits = ncerRenderWholeCell3(data->frameBuffer, data->ncer.cells + data->cell, ncgr, nclr, transferEntry, 
+		translateX, translateY, 1, data->oam, 1.0f, 0.0f, 0.0f, 1.0f);
+
 	//draw lines if needed
 	if (data->showCellBounds) {
 		int minX = cell->minX + translateX, maxX = cell->maxX + translateX - 1;
@@ -53,18 +57,19 @@ VOID PaintNcerViewer(HWND hWnd) {
 		}
 	}
 
-	HBITMAP hbm = CreateBitmap(width, height, 1, 32, bits);
+	HBITMAP hbm = CreateBitmap(512, 256, 1, 32, bits);
 	HDC hCompatibleDC = CreateCompatibleDC(hWindowDC);
 	SelectObject(hCompatibleDC, hbm);
-	BitBlt(hWindowDC, 0, 0, width, height, hCompatibleDC, 0, 0, SRCCOPY);
-	free(bits);
+	BitBlt(hWindowDC, 0, 0, 512, 256, hCompatibleDC, 0, 0, SRCCOPY);
 	DeleteObject(hbm);
+
+	int width, height;
 	bits = ncerCellToBitmap(&info, ncgr, nclr, &width, &height, 1);
 	hbm = CreateBitmap(width, height, 1, 32, bits);
 	SelectObject(hCompatibleDC, hbm);
 	BitBlt(hWindowDC, 512 - 69, 256 + 5, width, height, hCompatibleDC, 0, 0, SRCCOPY);
-	free(bits);
 	DeleteObject(hbm);
+	free(bits);
 
 	DeleteObject(hCompatibleDC);
 
@@ -256,10 +261,6 @@ void ncerEditorRedo(HWND hWnd) {
 
 	UpdateControls(hWnd);
 }
-
-#define NV_INITIALIZE (WM_USER+1)
-#define NV_SETTITLE (WM_USER+2)
-#define NV_INITIALIZE_IMMEDIATE (WM_USER+3)
 
 LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	NCERVIEWERDATA *data = (NCERVIEWERDATA *) GetWindowLongPtr(hWnd, 0);
@@ -589,34 +590,42 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					NCER_CELL *cell = data->ncer.cells + data->cell;
 					WORD attr2 = cell->attr[2 + 3 * data->oam];
 					WORD attr0 = cell->attr[0 + 3 * data->oam];
-					if ((attr0 >> 13) & 1) chr >>= 1;
+					if ((attr0 >> 13) & 1) chr &= ~1;
 					attr2 = attr2 & 0xFC00;
 					attr2 |= chr & 0x3FF;
 					cell->attr[2 + 3 * data->oam] = attr2;
 					InvalidateRect(hWnd, NULL, TRUE);
 					changed = 1;
 				} else if (notification == BN_CLICKED && (hWndControl == data->hWndImportBitmap || hWndControl == data->hWndImportReplacePalette)) {
-					LPWSTR path = openFileDialog(hWnd, L"Select Image", L"Supported Image Files\0*.png;*.bmp;*.gif;*.jpg;*.jpeg;*.tga\0All Files\0*.*\0", L"");
-					if (path == NULL) break;
-
 					HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
 					NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 					HWND hWndNclrViewer = nitroPaintStruct->hWndNclrViewer;
 					HWND hWndNcgrViewer = nitroPaintStruct->hWndNcgrViewer;
-					NCGRVIEWERDATA *ncgrViewerData = (NCGRVIEWERDATA *) GetWindowLongPtr(hWndNcgrViewer, 0);
 					NCLR *nclr = NULL;
-					NCGR *ncgr = &ncgrViewerData->ncgr;
+					NCGR *ncgr = NULL;
+					if (hWndNcgrViewer) {
+						NCGRVIEWERDATA *ncgrViewerData = (NCGRVIEWERDATA *) GetWindowLongPtr(hWndNcgrViewer, 0);
+						ncgr = &ncgrViewerData->ncgr;
+					}
 					if (hWndNclrViewer) {
 						NCLRVIEWERDATA *nclrViewerData = (NCLRVIEWERDATA *) GetWindowLongPtr(hWndNclrViewer, 0);
 						nclr = &nclrViewerData->nclr;
 					}
+
+					if (nclr == NULL || ncgr == NULL) {
+						MessageBox(hWnd, L"Open palette and character graphics are required to import.", L"No NCLR", MB_ICONERROR);
+						break;
+					}
+
+					LPWSTR path = openFileDialog(hWnd, L"Select Image", L"Supported Image Files\0*.png;*.bmp;*.gif;*.jpg;*.jpeg;*.tga\0All Files\0*.*\0", L"");
+					if (path == NULL) break;
 
 					NCER_CELL *cell = data->ncer.cells + data->cell;
 
 					BOOL createPalette = hWndControl == data->hWndImportReplacePalette;
 					BOOL dither = MessageBox(hWnd, L"Use dithering?", L"Dither", MB_ICONQUESTION | MB_YESNO) == IDYES;
 
-					DWORD *palette = (DWORD *) calloc(256, 4);
+					DWORD *palette = (DWORD *) calloc(nclr->nColors, 4);
 					COLOR *nitroPalette = nclr->colors;
 					int paletteSize = 1 << ncgr->nBits;
 					for (int i = 0; i < nclr->nColors; i++) {
@@ -685,7 +694,7 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 									DWORD col = pixels[x + y * width];
 									int _x = cellX % 8, _y = cellY % 8;
 									if (col >> 24 > 0x80) {
-										int closest = closestpalette(*(RGB *) &col, (RGB *) palette + (16 * info.palette) + 1, paletteSize - 1, NULL) + 1;
+										int closest = closestPalette(col, palette + (info.palette << ncgr->nBits) + 1, paletteSize - 1) + 1;
 										character[_x + _y * 8] = closest;
 
 										//diffuse
@@ -979,7 +988,11 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						}
 
 						int translateX = 256 - (cell->maxX + cell->minX) / 2, translateY = 128 - (cell->maxY + cell->minY) / 2;
-						DWORD *bits = ncerRenderWholeCell(cell, ncgr, nclr, translateX, translateY, &width, &height, 0, -1);
+						COLOR32 *bits = ncerRenderWholeCell(cell, ncgr, nclr, translateX, translateY, &width, &height, 0, -1);
+						for (int i = 0; i < width * height; i++) {
+							COLOR32 c = bits[i];
+							bits[i] = REVERSE(c);
+						}
 
 						writeImage(bits, width, height, location);
 						free(bits);
@@ -995,12 +1008,13 @@ LRESULT WINAPI NcerViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
 			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 			nitroPaintStruct->hWndNcerViewer = NULL;
-			ncerFree((OBJECT_HEADER *) &data->ncer);
-			free(data);
 			if (nitroPaintStruct->hWndNclrViewer) InvalidateRect(nitroPaintStruct->hWndNclrViewer, NULL, FALSE);
 			undoDestroy(&data->undo);
+			free(data);
 			break;
 		}
+		case NV_GETTYPE:
+			return FILE_TYPE_CELL;
 	}
 	return DefChildProc(hWnd, msg, wParam, lParam);
 }

@@ -96,13 +96,32 @@
 #define ID_NEW_NEWCELLBANK              40097
 #define ID_NSCRMENU_MAKEIDENTITY        40098
 #define ID_MENU_IMPORT                  40099
+#define ID_ACCELERATOR_ZOOMIN           40100
+#define ID_ACCELERATOR_ZOOMOUT          40101
+#define ID_TOOLS_COLORPICKER            40103
+#define ID_MENU_ANIMATEPALETTE          40104
+#define ID_FILE_CLOSEALL                40105
+#define ID_ACCELERATOR_CLOSEALL         40106
+#define ID_ACCELERATOR_ZOOMIN2          40108
+#define ID_ACCELERATOR_ZOOMOUT2         40110
+#define ID_TEXTUREMENU_COPY             40112
+#define ID_NEW_NEWPALETTE               40113
+#define ID_NEW_NEWSCREEN                40114
+#define ID_ARRANGEPALETTE_NEURO         40115
+#define ID_VIEW_SINGLE                  40116
+#define ID_TOOLS_SCREEN                 40117
+#define ID_SCREEN_SPLITSCREEN           40118
+#define ID_NEW_NEWTEXTUREARCHIVE        40119
+#define ID_TOOLS_BATCHPROCESSING        40120
+#define ID_BATCHPROCESSING_TEXTURECONVERSION 40121
+#define ID_TOOLS_TEXTUREVRAMSUMMARY     40122
 
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        111
-#define _APS_NEXT_COMMAND_VALUE         40100
+#define _APS_NEXT_COMMAND_VALUE         40123
 #define _APS_NEXT_CONTROL_VALUE         1001
 #define _APS_NEXT_SYMED_VALUE           101
 #endif

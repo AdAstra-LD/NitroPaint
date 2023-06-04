@@ -2,22 +2,31 @@
 #include "nclr.h"
 #include "nscr.h"
 #include "color.h"
+#include "g2dfile.h"
+
 #include <stdio.h>
 
-LPCWSTR characterFormatNames[] = { L"Invalid", L"NCGR", L"Hudson", L"Hudson 2", L"NCBR", L"Binary", NULL };
+LPCWSTR characterFormatNames[] = { L"Invalid", L"NCGR", L"Hudson", L"Hudson 2", L"NCBR", L"Binary", L"NCG", NULL };
 
 int calculateWidth(int nTiles) {
 	int width = 1;
+
+	//if tile count is a multiple of 32, use it
+	if (nTiles % 32 == 0) {
+		return 32;
+	}
+
+	//iterate factors
 	for (int i = 1; i < nTiles; i++) {
 		if (i * i > nTiles) break;
 		if (nTiles % i == 0) width = i;
 	}
 	int height = nTiles / width;
-	if (width > height) return height; //prioritize wide over tall output
-	return width;
+	if (width > height) return width; //prioritize wide over tall output
+	return height;
 }
 
-int ncgrIsValidHudson(LPBYTE buffer, int size) {
+int ncgrIsValidHudson(unsigned char *buffer, unsigned int size) {
 	if (size < 8) return 0;
 	if (*buffer == 0x10) return 0;
 	if (((*buffer) & 0xF0) != 0) return 0;
@@ -34,9 +43,18 @@ int ncgrIsValidHudson(LPBYTE buffer, int size) {
 	return NCGR_TYPE_HUDSON;
 }
 
-int ncgrIsValidBin(LPBYTE buffer, int size) {
+int ncgrIsValidBin(unsigned char *buffer, unsigned int size) {
 	if (size & 0x1F) return 0;
 	return NCGR_TYPE_BIN;
+}
+
+int ncgrIsValidNcg(unsigned char *buffer, unsigned int size) {
+	if (!g2dIsValid(buffer, size)) return 0;
+
+	char *sChar = g2dGetSectionByMagic(buffer, size, 'CHAR');
+	if (sChar == NULL) sChar = g2dGetSectionByMagic(buffer, size, 'RAHC');
+	if (sChar == NULL) return 0;
+	return 1;
 }
 
 void ncgrFree(OBJECT_HEADER *header) {
@@ -48,6 +66,19 @@ void ncgrFree(OBJECT_HEADER *header) {
 		free(ncgr->tiles);
 	}
 	ncgr->tiles = NULL;
+
+	if (ncgr->comment != NULL) {
+		free(ncgr->comment);
+		ncgr->comment = NULL;
+	}
+	if (ncgr->link != NULL) {
+		free(ncgr->link);
+		ncgr->link = NULL;
+	}
+	if (ncgr->attr != NULL) {
+		free(ncgr->attr);
+		ncgr->attr = NULL;
+	}
 
 	COMBO2D *combo = ncgr->combo2d;
 	if (ncgr->combo2d != NULL) {
@@ -67,7 +98,7 @@ void ncgrInit(NCGR *ncgr, int format) {
 	ncgr->combo2d = NULL;
 }
 
-int hudsonReadCharacter(NCGR *ncgr, char *buffer, int size) {
+int hudsonReadCharacter(NCGR *ncgr, unsigned char *buffer, unsigned int size) {
 	if (size < 8) return 1; //file too small
 	if (*buffer == 0x10) return 1; //TODO: LZ77 decompress
 	int type = ncgrIsValidHudson(buffer, size);
@@ -76,13 +107,13 @@ int hudsonReadCharacter(NCGR *ncgr, char *buffer, int size) {
 	int nCharacters = 0;
 	if (type == NCGR_TYPE_HUDSON) {
 
-		int dataLength = *(WORD *) (buffer + 1);
+		unsigned int dataLength = *(uint16_t *) (buffer + 1);
 		dataLength -= 4;
 		if (dataLength + 8 > size) return 1;
 
-		nCharacters = *(WORD *) (buffer + 5);
+		nCharacters = *(uint16_t *) (buffer + 5);
 	} else if (type == NCGR_TYPE_HUDSON2) {
-		nCharacters = *(WORD *) (buffer + 1);
+		nCharacters = *(uint16_t *) (buffer + 1);
 	}
 
 	ncgrInit(ncgr, type);
@@ -106,7 +137,7 @@ int hudsonReadCharacter(NCGR *ncgr, char *buffer, int size) {
 	tilesX = calculateWidth(nCharacters);
 	tilesY = tileCount / tilesX;
 
-	BYTE ** tiles = (BYTE **) calloc(tileCount, sizeof(BYTE **));
+	BYTE **tiles = (BYTE **) calloc(tileCount, sizeof(BYTE **));
 	buffer += 0x4;
 	if (type == NCGR_TYPE_HUDSON) buffer += 0x4;
 	for (int i = 0; i < tileCount; i++) {
@@ -132,7 +163,7 @@ int hudsonReadCharacter(NCGR *ncgr, char *buffer, int size) {
 	return 0;
 }
 
-int ncgrReadCombo(NCGR *ncgr, char *buffer, int size) {
+int ncgrReadCombo(NCGR *ncgr, unsigned char *buffer, unsigned int size) {
 	int format = combo2dIsValid(buffer, size);
 	ncgrInit(ncgr, NCGR_TYPE_COMBO);
 
@@ -183,7 +214,7 @@ int ncgrReadCombo(NCGR *ncgr, char *buffer, int size) {
 	return 0;
 }
 
-int ncgrReadBin(NCGR *ncgr, char *buffer, int size) {
+int ncgrReadBin(NCGR *ncgr, unsigned char *buffer, unsigned int size) {
 	ncgrInit(ncgr, NCGR_TYPE_BIN);
 	ncgr->nTiles = size / 0x20;
 	ncgr->nBits = 4;
@@ -208,8 +239,68 @@ int ncgrReadBin(NCGR *ncgr, char *buffer, int size) {
 	return 0;
 }
 
-int ncgrRead(NCGR *ncgr, char *buffer, int size) {
+int ncgrReadNcg(NCGR *ncgr, unsigned char *buffer, unsigned int size) {
+	ncgrInit(ncgr, NCGR_TYPE_NC);
+
+	unsigned char *sChar = g2dGetSectionByMagic(buffer, size, 'CHAR');
+	if (sChar == NULL) sChar = g2dGetSectionByMagic(buffer, size, 'RAHC');
+	unsigned char *sAttr = g2dGetSectionByMagic(buffer, size, 'ATTR');
+	if (sAttr == NULL) sAttr = g2dGetSectionByMagic(buffer, size, 'RTTA');
+	unsigned char *sLink = g2dGetSectionByMagic(buffer, size, 'LINK');
+	if (sLink == NULL) sLink = g2dGetSectionByMagic(buffer, size, 'KNIL');
+	unsigned char *sCmnt = g2dGetSectionByMagic(buffer, size, 'CMNT');
+	if (sCmnt == NULL) sCmnt = g2dGetSectionByMagic(buffer, size, 'TNMC');
+	
+	ncgr->nBits = *(uint32_t *) (sChar + 0x10) == 0 ? 4 : 8;
+	ncgr->mappingMode = GX_OBJVRAMMODE_CHAR_1D_32K;
+	ncgr->tilesX = *(uint32_t *) (sChar + 0x8);
+	ncgr->tilesY = *(uint32_t *) (sChar + 0xC);
+	ncgr->nTiles = ncgr->tilesX * ncgr->tilesY;
+	ncgr->tileWidth = 8;
+
+	BYTE **tiles = (BYTE **) calloc(ncgr->nTiles, sizeof(BYTE **));
+	buffer = sChar + 0x14;
+	for (int i = 0; i < ncgr->nTiles; i++) {
+		tiles[i] = (BYTE *) calloc(8 * 8, 1);
+		BYTE *tile = tiles[i];
+		if (ncgr->nBits == 8) {
+			memcpy(tile, buffer, 64);
+			buffer += 64;
+		} else if (ncgr->nBits == 4) {
+			for (int j = 0; j < 32; j++) {
+				BYTE b = *buffer;
+				tile[j * 2] = b & 0xF;
+				tile[j * 2 + 1] = b >> 4;
+				buffer++;
+			}
+		}
+	}
+	ncgr->tiles = tiles;
+
+	if (sCmnt != NULL) {
+		int len = *(uint32_t *) (sCmnt + 4) - 8;
+		ncgr->comment = (char *) calloc(len, 1);
+		memcpy(ncgr->comment, sCmnt + 8, len);
+	}
+	if (sLink != NULL) {
+		int len = *(uint32_t *) (sLink + 4) - 8;
+		ncgr->link = (char *) calloc(len, 1);
+		memcpy(ncgr->link, sLink + 8, len);
+	}
+	if (sAttr != NULL) {
+		int attrSize = *(uint32_t *) (sAttr + 0x4) - 0x10;
+		ncgr->attrWidth = *(uint32_t *) (sAttr + 0x8);
+		ncgr->attrHeight = *(uint32_t *) (sAttr + 0xC);
+		ncgr->attr = (unsigned char *) calloc(attrSize, 1);
+		memcpy(ncgr->attr, sAttr + 0x10, attrSize);
+	}
+
+	return 0;
+}
+
+int ncgrRead(NCGR *ncgr, unsigned char *buffer, unsigned int size) {
 	if (*(DWORD *) buffer != 0x4E434752) {
+		if (ncgrIsValidNcg(buffer, size)) return ncgrReadNcg(ncgr, buffer, size);
 		if (ncgrIsValidHudson(buffer, size)) return hudsonReadCharacter(ncgr, buffer, size);
 		if (combo2dIsValid(buffer, size)) return ncgrReadCombo(ncgr, buffer, size);
 		if (ncgrIsValidBin(buffer, size)) return ncgrReadBin(ncgr, buffer, size);
@@ -311,9 +402,9 @@ int ncgrReadFile(NCGR *ncgr, LPCWSTR path) {
 	return fileRead(path, (OBJECT_HEADER *) ncgr, (OBJECT_READER) ncgrRead);
 }
 
-int ncgrGetTile(NCGR * ncgr, NCLR * nclr, int x, int y, DWORD * out, int previewPalette, BOOL drawChecker, BOOL transparent) {
+int ncgrGetTile(NCGR *ncgr, NCLR *nclr, int x, int y, COLOR32 *out, int previewPalette, int drawChecker, int transparent) {
 	int nIndex = x + y * ncgr->tilesX;
-	BYTE * tile = ncgr->tiles[nIndex];
+	BYTE *tile = ncgr->tiles[nIndex];
 	int nTiles = ncgr->nTiles;
 	if (x + y * ncgr->tilesX < nTiles) {
 		for (int i = 0; i < 64; i++) {
@@ -344,126 +435,215 @@ int ncgrGetTile(NCGR * ncgr, NCLR * nclr, int x, int y, DWORD * out, int preview
 	return 0;
 }
 
-int ncgrWrite(NCGR *ncgr, BSTREAM *stream) {
-	int status = 0;
+void ncgrChangeWidth(NCGR *ncgr, int width) {
+	//unimplemented right now
+	if (ncgr->nTiles % width) return;
 
-	if (ncgr->header.format == NCGR_TYPE_NCGR || ncgr->header.format == NCGR_TYPE_NCBR) {
-		BYTE ncgrHeader[] = { 'R', 'G', 'C', 'N', 0xFF, 0xFE, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0, 0x1, 0 };
-		BYTE charHeader[] = { 'R', 'A', 'H', 'C', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-		if (ncgr->header.format == NCGR_TYPE_NCBR) {
-			charHeader[20] = 1;
-		}
-
-		int nTiles = ncgr->nTiles;
-		int nBytesPerTile = 64;
-		if (ncgr->nBits == 4) nBytesPerTile >>= 1;
-		int sectionSize = 0x20 + nTiles * nBytesPerTile;
-		int fileSize = 0x10 + sectionSize;
-
-		if (ncgr->nBits == 8) *(int *) (charHeader + 0xC) = 4;
-		else if (ncgr->nBits == 4) *(int *) (charHeader + 0xC) = 3;
-		*(int *) (charHeader + 0x10) = ncgr->mappingMode;
-		*(int *) (charHeader + 0x4) = sectionSize;
-		if (NCGR_2D(ncgr->mappingMode)) {
-			*(unsigned short *) (charHeader + 0x8) = ncgr->tilesY;
-			*(unsigned short *) (charHeader + 0xA) = ncgr->tilesX;
-		} else {
-			*(int *) (charHeader + 0x8) = 0xFFFFFFFF;
-		}
-		*(int *) (charHeader + 0x1C) = 0x18;
-		*(int *) (charHeader + 0x18) = sectionSize - 0x20;
-
-		*(int *) (ncgrHeader + 0x8) = fileSize;
-
-		bstreamWrite(stream, ncgrHeader, sizeof(ncgrHeader));
-		bstreamWrite(stream, charHeader, sizeof(charHeader));
-		if (ncgr->header.format == NCGR_TYPE_NCGR) {
-			for (int i = 0; i < ncgr->nTiles; i++) {
-				if (ncgr->nBits == 8) {
-					bstreamWrite(stream, ncgr->tiles[i], 64);
-				} else {
-					BYTE buffer[32];
-					for (int j = 0; j < 32; j++) {
-						BYTE b = ncgr->tiles[i][(j << 1)] | (ncgr->tiles[i][(j << 1) + 1] << 4);
-
-						buffer[j] = b;
-					}
-					bstreamWrite(stream, buffer, 32);
-				}
-			}
-		} else if (ncgr->header.format == NCGR_TYPE_NCBR) {
-			BYTE *bmp = (BYTE *) calloc(nTiles, 8 * ncgr->nBits);
-			int nWidth = ncgr->tilesX * 8;
-			for (int y = 0; y < ncgr->tilesY; y++) {
-				for (int x = 0; x < ncgr->tilesX; x++) {
-					BYTE *tile = ncgr->tiles[x + y * ncgr->tilesX];
-					if (ncgr->nBits == 8) {
-						for (int i = 0; i < 64; i++) {
-							int tX = x * 8 + (i % 8);
-							int tY = y * 8 + (i / 8);
-							bmp[tX + tY * nWidth] = tile[i];
-						}
-					} else {
-						for (int i = 0; i < 32; i++) {
-							int tX = x * 8 + ((i * 2) % 8);
-							int tY = y * 8 + (i / 4);
-							bmp[(tX + tY * nWidth) / 2] = tile[i * 2] | (tile[i * 2 + 1] << 4);
-						}
-					}
-				}
-			}
-			bstreamWrite(stream, bmp, nTiles * 8 * ncgr->nBits);
-			free(bmp);
-		}
-	} else if(ncgr->header.format == NCGR_TYPE_HUDSON || ncgr->header.format == NCGR_TYPE_HUDSON2) {
-
-		if (ncgr->header.format == NCGR_TYPE_HUDSON) {
-			BYTE header[] = { 0, 0, 0, 0, 1, 0, 0, 0 };
-			if (ncgr->nBits == 4) header[4] = 0;
-			*(WORD *) (header + 5) = ncgr->nTiles;
-			int nCharacterBytes = 64 * ncgr->nTiles;
-			if (ncgr->nBits == 4) nCharacterBytes >>= 1;
-			*(WORD *) (header + 1) = nCharacterBytes + 4;
-
-			bstreamWrite(stream, header, sizeof(header));
-		} else if(ncgr->header.format == NCGR_TYPE_HUDSON2) {
-			BYTE header[] = { 0, 0, 0, 0 };
-			*(WORD *) (header + 1) = ncgr->nTiles;
-			bstreamWrite(stream, header, sizeof(header));
-		}
-
-		for (int i = 0; i < ncgr->nTiles; i++) {
-			if (ncgr->nBits == 8) {
-				bstreamWrite(stream, ncgr->tiles[i], 64);
-			} else {
-				BYTE buffer[32];
-				for (int j = 0; j < 32; j++) {
-					BYTE b = ncgr->tiles[i][(j << 1)] | (ncgr->tiles[i][(j << 1) + 1] << 4);
-
-					buffer[j] = b;
-				}
-				bstreamWrite(stream, buffer, 32);
-			}
-		}
-	} else if (ncgr->header.format == NCGR_TYPE_BIN) {
-		for (int i = 0; i < ncgr->nTiles; i++) {
-			if (ncgr->nBits == 8) {
-				bstreamWrite(stream, ncgr->tiles[i], 64);
-			} else {
-				BYTE t[32];
-				for (int j = 0; j < 32; j++) {
-					t[j] = ncgr->tiles[i][j * 2] | (ncgr->tiles[i][j * 2 + 1] << 4);
-				}
-				bstreamWrite(stream, t, 32);
-			}
-		}
-	} else if (ncgr->header.format == NCGR_TYPE_COMBO) {
-		status = combo2dWrite(ncgr->combo2d, stream);
+	//only matters for bitmap graphics
+	if (ncgr->header.format != NCGR_TYPE_NCBR) {
+		ncgr->tilesX = width;
+		ncgr->tilesY = ncgr->nTiles / width;
+		return;
 	}
 
-	return status;
+	//use a temporary buffer to unswizzle and reswizzle
+	BYTE *bmp = (BYTE *) calloc(ncgr->tilesX * ncgr->tilesY * 64, 1);
+	int bmpWidth = ncgr->tilesX * 8, bmpHeight = ncgr->tilesY * 8;
+	for (int y = 0; y < ncgr->tilesY; y++) {
+		for (int x = 0; x < ncgr->tilesX; x++) {
+			BYTE *tile = ncgr->tiles[y * ncgr->tilesX + x];
+			int bmpX = x * 8;
+			int bmpY = y * 8;
+
+			for (int i = 0; i < 8; i++) {
+				memcpy(bmp + bmpX + (bmpY + i) * bmpWidth, tile + i * 8, 8);
+			}
+		}
+	}
+
+	//update width and height, then reswizzle
+	ncgr->tilesX = width;
+	ncgr->tilesY = ncgr->nTiles / width;
+	bmpWidth = ncgr->tilesX * 8, bmpHeight = ncgr->tilesY * 8;
+	for (int y = 0; y < ncgr->tilesY; y++) {
+		for (int x = 0; x < ncgr->tilesX; x++) {
+			BYTE *tile = ncgr->tiles[y * ncgr->tilesX + x];
+			int bmpX = x * 8;
+			int bmpY = y * 8;
+
+			for (int i = 0; i < 8; i++) {
+				memcpy(tile + i * 8, bmp + bmpX + (bmpY + i) * bmpWidth, 8);
+			}
+		}
+	}
+
+	free(bmp);
 }
 
-int ncgrWriteFile(NCGR *ncgr, LPWSTR name) {
+int ncgrWriteBin(NCGR *ncgr, BSTREAM *stream) {
+	for (int i = 0; i < ncgr->nTiles; i++) {
+		if (ncgr->nBits == 8) {
+			bstreamWrite(stream, ncgr->tiles[i], 64);
+		} else {
+			BYTE t[32];
+			for (int j = 0; j < 32; j++) {
+				t[j] = ncgr->tiles[i][j * 2] | (ncgr->tiles[i][j * 2 + 1] << 4);
+			}
+			bstreamWrite(stream, t, 32);
+		}
+	}
+	return 0;
+}
+
+int ncgrWriteNcgr(NCGR *ncgr, BSTREAM *stream) {
+	unsigned char ncgrHeader[] = { 'R', 'G', 'C', 'N', 0xFF, 0xFE, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0, 0x1, 0 };
+	unsigned char charHeader[] = { 'R', 'A', 'H', 'C', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	if (ncgr->header.format == NCGR_TYPE_NCBR) {
+		charHeader[20] = 1;
+	}
+
+	int nTiles = ncgr->nTiles;
+	int nBytesPerTile = 64;
+	if (ncgr->nBits == 4) nBytesPerTile >>= 1;
+	int sectionSize = 0x20 + nTiles * nBytesPerTile;
+	int fileSize = 0x10 + sectionSize;
+
+	if (ncgr->nBits == 8) *(int *) (charHeader + 0xC) = 4;
+	else if (ncgr->nBits == 4) *(int *) (charHeader + 0xC) = 3;
+	*(int *) (charHeader + 0x10) = ncgr->mappingMode;
+	*(int *) (charHeader + 0x4) = sectionSize;
+	if (NCGR_2D(ncgr->mappingMode)) {
+		*(unsigned short *) (charHeader + 0x8) = ncgr->tilesY;
+		*(unsigned short *) (charHeader + 0xA) = ncgr->tilesX;
+	} else {
+		*(int *) (charHeader + 0x8) = 0xFFFFFFFF;
+	}
+	*(int *) (charHeader + 0x1C) = 0x18;
+	*(int *) (charHeader + 0x18) = sectionSize - 0x20;
+
+	*(int *) (ncgrHeader + 0x8) = fileSize;
+
+	bstreamWrite(stream, ncgrHeader, sizeof(ncgrHeader));
+	bstreamWrite(stream, charHeader, sizeof(charHeader));
+	if (ncgr->header.format == NCGR_TYPE_NCGR) {
+		ncgrWriteBin(ncgr, stream);
+	} else if (ncgr->header.format == NCGR_TYPE_NCBR) {
+		BYTE *bmp = (BYTE *) calloc(nTiles, 8 * ncgr->nBits);
+		int nWidth = ncgr->tilesX * 8;
+		for (int y = 0; y < ncgr->tilesY; y++) {
+			for (int x = 0; x < ncgr->tilesX; x++) {
+				BYTE *tile = ncgr->tiles[x + y * ncgr->tilesX];
+				if (ncgr->nBits == 8) {
+					for (int i = 0; i < 64; i++) {
+						int tX = x * 8 + (i % 8);
+						int tY = y * 8 + (i / 8);
+						bmp[tX + tY * nWidth] = tile[i];
+					}
+				} else {
+					for (int i = 0; i < 32; i++) {
+						int tX = x * 8 + ((i * 2) % 8);
+						int tY = y * 8 + (i / 4);
+						bmp[(tX + tY * nWidth) / 2] = tile[i * 2] | (tile[i * 2 + 1] << 4);
+					}
+				}
+			}
+		}
+		bstreamWrite(stream, bmp, nTiles * 8 * ncgr->nBits);
+		free(bmp);
+	}
+	return 0;
+}
+
+int ncgrWriteNcg(NCGR *ncgr, BSTREAM *stream) {
+	unsigned char ncgHeader[] = { 'N', 'C', 'C', 'G', 0xFF, 0xFE, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x10, 0, 0x1, 0 };
+	unsigned char charHeader[] = { 'C', 'H', 'A', 'R', 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	unsigned char attrHeader[] = { 'A', 'T', 'T', 'R', 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	unsigned char linkHeader[] = { 'L', 'I', 'N', 'K', 0x08, 0, 0, 0 };
+	unsigned char cmntHeader[] = { 'C', 'M', 'N', 'T', 0x08, 0, 0, 0 };
+
+	int charSize = ncgr->nTiles * ncgr->nBits * 8 + sizeof(charHeader);
+	int attrSize = ncgr->attrWidth * ncgr->attrHeight + sizeof(attrHeader);
+	int linkSize = ncgr->link == NULL ? 0 : (((strlen(ncgr->link) + 4) & ~3) + sizeof(linkHeader));
+	int cmntSize = ncgr->comment == NULL ? 0 : (((strlen(ncgr->comment) + 4) & ~3) + sizeof(cmntHeader));
+	int totalSize = sizeof(ncgHeader) + charSize + attrSize + linkSize + cmntSize;
+	*(uint32_t *) (charHeader + 0x4) = charSize;
+	*(uint32_t *) (charHeader + 0x8) = ncgr->tilesX;
+	*(uint32_t *) (charHeader + 0xC) = ncgr->tilesY;
+	*(uint32_t *) (charHeader + 0x10) = ncgr->nBits == 8;
+	*(uint32_t *) (attrHeader + 0x4) = attrSize;
+	*(uint32_t *) (attrHeader + 0x8) = ncgr->attrWidth;
+	*(uint32_t *) (attrHeader + 0xC) = ncgr->attrHeight;
+	*(uint32_t *) (linkHeader + 0x4) = linkSize;
+	*(uint32_t *) (cmntHeader + 0x4) = cmntSize;
+	*(uint32_t *) (ncgHeader + 0x8) = totalSize;
+	*(uint16_t *) (ncgHeader + 0xE) = !!charSize + !!attrSize + !!linkSize + !!cmntSize;
+	bstreamWrite(stream, ncgHeader, sizeof(ncgHeader));
+	bstreamWrite(stream, charHeader, sizeof(charHeader));
+	ncgrWriteBin(ncgr, stream);
+	if (ncgr->tilesX == ncgr->attrWidth && ncgr->tilesY == ncgr->attrHeight) {
+		bstreamWrite(stream, attrHeader, sizeof(attrHeader));
+		bstreamWrite(stream, ncgr->attr, ncgr->attrWidth * ncgr->attrHeight);
+	} else {
+		unsigned char *dummy = (unsigned char *) calloc(ncgr->tilesX * ncgr->tilesY, 1);
+		*(uint32_t *) (attrHeader + 0x8) = ncgr->tilesX;
+		*(uint32_t *) (attrHeader + 0xC) = ncgr->tilesY;
+		bstreamWrite(stream, attrHeader, sizeof(attrHeader));
+		bstreamWrite(stream, dummy, ncgr->tilesX * ncgr->tilesY);
+		free(dummy);
+	}
+	if (linkSize) {
+		bstreamWrite(stream, linkHeader, sizeof(linkHeader));
+		bstreamWrite(stream, ncgr->link, linkSize - sizeof(linkHeader));
+	}
+	if (cmntSize) {
+		bstreamWrite(stream, cmntHeader, sizeof(cmntHeader));
+		bstreamWrite(stream, ncgr->comment, cmntSize - sizeof(cmntHeader));
+	}
+	return 0;
+}
+
+int ncgrWriteHudson(NCGR *ncgr, BSTREAM *stream) {
+	if (ncgr->header.format == NCGR_TYPE_HUDSON) {
+		BYTE header[] = { 0, 0, 0, 0, 1, 0, 0, 0 };
+		if (ncgr->nBits == 4) header[4] = 0;
+		*(WORD *) (header + 5) = ncgr->nTiles;
+		int nCharacterBytes = 64 * ncgr->nTiles;
+		if (ncgr->nBits == 4) nCharacterBytes >>= 1;
+		*(WORD *) (header + 1) = nCharacterBytes + 4;
+
+		bstreamWrite(stream, header, sizeof(header));
+	} else if(ncgr->header.format == NCGR_TYPE_HUDSON2) {
+		BYTE header[] = { 0, 0, 0, 0 };
+		*(WORD *) (header + 1) = ncgr->nTiles;
+		bstreamWrite(stream, header, sizeof(header));
+	}
+
+	ncgrWriteBin(ncgr, stream);
+	return 0;
+}
+
+int ncgrWriteCombo(NCGR *ncgr, BSTREAM *stream) {
+	return combo2dWrite(ncgr->combo2d, stream);
+}
+
+int ncgrWrite(NCGR *ncgr, BSTREAM *stream) {
+	switch (ncgr->header.format) {
+		case NCGR_TYPE_NCGR:
+		case NCGR_TYPE_NCBR:
+			return ncgrWriteNcgr(ncgr, stream);
+		case NCGR_TYPE_NC:
+			return ncgrWriteNcg(ncgr, stream);
+		case NCGR_TYPE_HUDSON:
+		case NCGR_TYPE_HUDSON2:
+			return ncgrWriteHudson(ncgr, stream);
+		case NCGR_TYPE_BIN:
+			return ncgrWriteBin(ncgr, stream);
+		case NCGR_TYPE_COMBO:
+			return ncgrWriteCombo(ncgr, stream);
+	}
+	return 1;
+}
+
+int ncgrWriteFile(NCGR *ncgr, LPCWSTR name) {
 	return fileWrite(name, (OBJECT_HEADER *) ncgr, (OBJECT_WRITER) ncgrWrite);
 }

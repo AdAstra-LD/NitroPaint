@@ -1,4 +1,7 @@
+#include <Windows.h>
+#include <CommCtrl.h>
 #include <math.h>
+
 #include "nscrviewer.h"
 #include "ncgrviewer.h"
 #include "nclrviewer.h"
@@ -11,13 +14,6 @@
 #include "tiler.h"
 
 extern HICON g_appIcon;
-
-#define NV_INITIALIZE (WM_USER+1)
-#define NV_SETDATA (WM_USER+2)
-#define NV_INITIMPORTDIALOG (WM_USER+3)
-#define NV_RECALCULATE (WM_USER+4)
-#define NV_INITIALIZE_IMMEDIATE (WM_USER+5)
-#define NV_SETTITLE (WM_USER+6)
 
 DWORD *renderNscrBits(NSCR *renderNscr, NCGR *renderNcgr, NCLR *renderNclr, int tileBase, BOOL drawGrid, BOOL checker, int *width, int *height, int tileMarks, int highlightTile, int highlightColor, int selStartX, int selStartY, int selEndX, int selEndY, BOOL transparent) {
 	int bWidth = renderNscr->nWidth;
@@ -132,14 +128,52 @@ DWORD *renderNscrBits(NSCR *renderNscr, NCGR *renderNcgr, NCLR *renderNclr, int 
 		}
 	}
 
-	/*for (int i = 0; i < bWidth * bHeight; i++) {
-		DWORD d = bits[i];
-		int r = d & 0xFF;
-		int g = (d >> 8) & 0xFF;
-		int b = (d >> 16) & 0xFF;
-		int a = (d >> 24) & 0xFF;
-		bits[i] = b | (g << 8) | (r << 16) | (a << 24);
-	}*/
+	return bits;
+}
+
+unsigned char *renderNscrIndexed(NSCR *nscr, NCGR *ncgr, int tileBase, int *width, int *height, BOOL transparent) {
+	int bWidth = nscr->nWidth;
+	int bHeight = nscr->nHeight;
+	*width = bWidth;
+	*height = bHeight;
+
+	unsigned char *bits = (unsigned char *) calloc(bWidth * bHeight, 1);
+
+	int tilesX = nscr->nWidth >> 3;
+	int tilesY = nscr->nHeight >> 3;
+
+	unsigned char block[64];
+	for (int y = 0; y < tilesY; y++) {
+		int offsetY = y * 8;
+		for (int x = 0; x < tilesX; x++) {
+			int offsetX = x * 8;
+
+			//fetch screen info
+			uint16_t scr = nscr->data[x + y * tilesX];
+			int chr = (scr & 0x3FF) - tileBase;
+			int flip = scr >> 10;
+			int pal = scr >> 12;
+
+			if (chr >= 0 && chr < ncgr->nTiles) {
+				unsigned char *chrData = ncgr->tiles[chr];
+				for (int i = 0; i < 64; i++) {
+					int tileX = i % 8;
+					int tileY = i / 8;
+					if (flip & TILE_FLIPX) tileX ^= 7;
+					if (flip & TILE_FLIPY) tileY ^= 7;
+					block[i] = chrData[tileX + tileY * 8] | (pal << 4);
+				}
+			} else {
+				memset(block, 0, sizeof(block));
+			}
+			
+			int destOffset = x * 8 + y * 8 * tilesX * 8;
+			for (int i = 0; i < 8; i++) {
+				memcpy(bits + destOffset + i * bWidth, block + i * 8, 8);
+			}
+		}
+	}
+
 	return bits;
 }
 
@@ -359,10 +393,33 @@ LRESULT WINAPI NscrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						}
 						nscr = &data->nscr;
 
-						DWORD *bits = renderNscrBits(nscr, ncgr, nclr, data->tileBase, FALSE, FALSE, &width, &height, -1, -1, -1, -1, -1, -1, -1, data->transparent);
-						
-						writeImage(bits, width, height, location);
-						free(bits);
+						//check: should we output indexed? If palette size > 256, we can't
+						if (nclr->nColors <= 256) {
+							//write 8bpp indexed
+							COLOR32 palette[256] = { 0 };
+							int transparentOutput = 1;
+							int paletteSize = 1 << ncgr->nBits;
+							if (nclr != NULL) {
+								for (int i = 0; i < min(nclr->nColors, 256); i++) {
+									int makeTransparent = transparentOutput && ((i % paletteSize) == 0);
+
+									palette[i] = ColorConvertFromDS(nclr->colors[i]);
+									if (!makeTransparent) palette[i] |= 0xFF000000;
+								}
+							}
+							unsigned char *bits = renderNscrIndexed(nscr, ncgr, data->tileBase, &width, &height, TRUE);
+							imageWriteIndexed(bits, width, height, palette, 256, location);
+							free(bits);
+						} else {
+							//write direct
+							COLOR32 *bits = renderNscrBits(nscr, ncgr, nclr, data->tileBase, FALSE, FALSE, &width, &height, -1, -1, -1, -1, -1, -1, -1, TRUE);
+							for (int i = 0; i < width * height; i++) {
+								COLOR32 c = bits[i];
+								bits[i] = REVERSE(c);
+							}
+							imageWrite(bits, width, height, location);
+							free(bits);
+						}
 						free(location);
 						break;
 					}
@@ -455,6 +512,9 @@ LRESULT WINAPI NscrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 								case NSCR_TYPE_COMBO:
 									filter = L"Combination Files (*.dat, *.bin)\0*.dat;*.bin\0";
 									break;
+								case NSCR_TYPE_NC:
+									filter = L"NSC Files (*.nsc)\0*.nsc\0All Files\0*.*\0";
+									break;
 							}
 							LPWSTR path = saveFileDialog(getMainWindow(hWnd), L"Save As...", filter, L"nscr");
 							if (path != NULL) {
@@ -470,6 +530,7 @@ LRESULT WINAPI NscrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					{
 						HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
 						HWND h = CreateWindow(L"NscrBitmapImportClass", L"Import Bitmap", WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_THICKFRAME), CW_USEDEFAULT, CW_USEDEFAULT, 300, 200, hWndMain, NULL, NULL, NULL);
+						SendMessage(h, NV_INITIALIZE, 0, (LPARAM) hWnd);
 						WORD d = data->nscr.data[data->contextHoverX + data->contextHoverY * (data->nscr.nWidth >> 3)];
 						SendMessage(h, NV_INITIMPORTDIALOG, d, data->contextHoverX | (data->contextHoverY << 16));
 						ShowWindow(h, SW_SHOW);
@@ -690,9 +751,6 @@ LRESULT WINAPI NscrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			if (data->hWndTileEditor) DestroyWindow(data->hWndTileEditor);
 			fileFree((OBJECT_HEADER *) &data->nscr);
 			free(data);
-			HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
-			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-			nitroPaintStruct->hWndNscrViewer = NULL;
 			SetWindowLongPtr(hWnd, 0, 0);
 			break;
 		}
@@ -706,69 +764,65 @@ LRESULT WINAPI NscrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			SendMessage(data->hWndSelectionSize, WM_SETTEXT, 0, (LPARAM) L"");
 			break;
 		}
+		case NV_GETTYPE:
+			return FILE_TYPE_SCREEN;
 	}
 	return DefChildProc(hWnd, msg, wParam, lParam);
 }
 
-int calculatePaletteCharError(DWORD *block, DWORD *pals, BYTE *character, int flip, int nMaxError) {
-	int error = 0;
+double calculatePaletteCharError(REDUCTION *reduction, COLOR32 *block, int *pals, unsigned char *character, int flip, double maxError) {
+	double error = 0;
 	for (int i = 0; i < 64; i++) { //0b111 111
 		int srcIndex = i;
 		if (flip & TILE_FLIPX) srcIndex ^= 7;
 		if (flip & TILE_FLIPY) srcIndex ^= 7 << 3;
 
-		DWORD col = block[srcIndex];
-		int r = col & 0xFF;
-		int g = (col >> 8) & 0xFF;
-		int b = (col >> 16) & 0xFF;
-		int a = (col >> 24) & 0xFF;
+		//convert source image pixel
+		int yiq[4];
+		COLOR32 col = block[srcIndex];
+		rgbToYiq(col, yiq);
 
+		//char pixel
 		int index = character[i];
-		DWORD matched = pals[index];
-		int mr = matched & 0xFF;
-		int mg = (matched >> 8) & 0xFF;
-		int mb = (matched >> 16) & 0xFF;
-		int ma = 255;
-		if (!index) {
-			ma = 0;
-			mr = r;
-			mg = g;
-			mb = b;
+		int *matchedYiq = pals + index * 4;
+		int matchedA = index > 0 ? 255 : 0;
+		if (matchedA == 0 && yiq[3] < 128) {
+			continue; //to prevent superfluous non-alpha difference
 		}
 
-		int dr = r - mr;
-		int dg = g - mg;
-		int db = b - mb;
-		int da = a - ma;
+		//diff
+		double dy = reduction->yWeight * (reduction->lumaTable[yiq[0]] - reduction->lumaTable[matchedYiq[0]]);
+		double di = reduction->iWeight * (yiq[1] - matchedYiq[1]);
+		double dq = reduction->qWeight * (yiq[2] - matchedYiq[2]);
+		double da = 40 * (yiq[3] - matchedA);
+		
 
-		int dy, du, dv;
-		convertRGBToYUV(dr, dg, db, &dy, &du, &dv);
-		error += 4 * dy * dy;
-		if (da) error += da * da * 16;
-		if (error >= nMaxError) return nMaxError;
-		error += du * du + dv * dv;
-		if (error >= nMaxError) return nMaxError;
+		error += dy * dy;
+		if (da != 0.0) error += da * da;
+		if (error >= maxError) return maxError;
+		error += di * di + dq * dq;
+		if (error >= maxError) return maxError;
 	}
 	return error;
 }
 
-int calculateBestPaletteCharError(DWORD *block, DWORD *pals, BYTE *character, int *flip, int nMaxError) {
-	int e00 = calculatePaletteCharError(block, pals, character, TILE_FLIPNONE, nMaxError);
+double calculateBestPaletteCharError(REDUCTION *reduction, COLOR32 *block, int *pals, unsigned char *character, int *flip, double maxError) {
+	double e00 = calculatePaletteCharError(reduction, block, pals, character, TILE_FLIPNONE, maxError);
 	if (e00 == 0) {
 		*flip = TILE_FLIPNONE;
 		return e00;
 	}
-	int e01 = calculatePaletteCharError(block, pals, character, TILE_FLIPX, nMaxError);
+	double e01 = calculatePaletteCharError(reduction, block, pals, character, TILE_FLIPX, maxError);
 	if (e01 == 0) {
 		*flip = TILE_FLIPX;
 		return e01;
 	}
-	int e10 = calculatePaletteCharError(block, pals, character, TILE_FLIPY, nMaxError);
+	double e10 = calculatePaletteCharError(reduction, block, pals, character, TILE_FLIPY, maxError);
 	if (e10 == 0) {
 		*flip = TILE_FLIPY;
 		return e10;
 	}
-	int e11 = calculatePaletteCharError(block, pals, character, TILE_FLIPXY, nMaxError);
+	double e11 = calculatePaletteCharError(reduction, block, pals, character, TILE_FLIPXY, maxError);
 	if (e11 == 0) {
 		*flip = TILE_FLIPXY;
 		return e11;
@@ -791,6 +845,7 @@ int calculateBestPaletteCharError(DWORD *block, DWORD *pals, BYTE *character, in
 }
 
 typedef struct {
+	HWND hWndEditor;
 	HWND hWndBitmapName;
 	HWND hWndBrowseButton;
 	HWND hWndPaletteInput;
@@ -800,50 +855,132 @@ typedef struct {
 	HWND hWndDiffuseAmount;
 	HWND hWndNewPaletteCheckbox;
 	HWND hWndNewCharactersCheckbox;
+	HWND hWndWriteScreenCheckbox;
+	HWND hWndWriteCharIndicesCheckbox;
+	HWND hWndPaletteSize;
+	HWND hWndPaletteOffset;
+	HWND hWndCharacterBase;
+	HWND hWndCharacterCount;
+	HWND hWndBalance;
+	HWND hWndColorBalance;
+	HWND hWndEnhanceColors;
+
 
 	int nscrTileX;
 	int nscrTileY;
 	int characterOrigin;
 } NSCRBITMAPIMPORTDATA;
 
-void nscrImportBitmap(NCLR *nclr, NCGR *ncgr, NSCR *nscr, DWORD *px, int width, int height, int tileBase, int nPalettes, int paletteNumber, BOOL newPalettes,
-					  BOOL newCharacters, BOOL dither, float diffuse, int maxTilesX, int maxTilesY, int nscrTileX, int nscrTileY, int *progress, int *progressMax) {
+void nscrImportBitmap(NCLR *nclr, NCGR *ncgr, NSCR *nscr, COLOR32 *px, int width, int height,
+					  int writeScreen, int writeCharacterIndices,
+					  int tileBase, int nPalettes, int paletteNumber, int paletteOffset, 
+					  int paletteSize, BOOL newPalettes, int writeCharBase, int nMaxChars,
+					  BOOL newCharacters, BOOL dither, float diffuse, int maxTilesX, int maxTilesY,
+					  int nscrTileX, int nscrTileY, int balance, int colorBalance, int enhanceColors,
+					  int *progress, int *progressMax) {
 	int tilesX = width / 8;
 	int tilesY = height / 8;
-	int paletteSize = ncgr->nBits == 4 ? 16 : 256;
+	int paletteStartFrom0 = 0;
+	int maxPaletteSize = ncgr->nBits == 4 ? 16 : 256;
+
+	//sanity checks
 	if (tilesX > maxTilesX) tilesX = maxTilesX;
 	if (tilesY > maxTilesY) tilesY = maxTilesY;
+	if (paletteOffset >= maxPaletteSize) paletteOffset = maxPaletteSize - 1;
+	if (paletteSize > maxPaletteSize) paletteSize = maxPaletteSize;
+	if (paletteOffset + paletteSize > maxPaletteSize) paletteSize = maxPaletteSize - paletteOffset;
+	if (writeCharBase >= ncgr->nTiles) writeCharBase = ncgr->nTiles - 1;
+	if (writeCharBase + nMaxChars > ncgr->nTiles) nMaxChars = ncgr->nTiles - writeCharBase;
 
-	*progressMax = tilesX * tilesY * 2;
-
-	DWORD *blocks = (DWORD *) calloc(tilesX * tilesY, 64 * 4);
-	DWORD *pals = calloc(nPalettes * paletteSize, 4);
-
-	//split image into 8x8 chunks, and find the average color in each.
-	DWORD *avgs = calloc(tilesX * tilesY, 4);
-	for (int y = 0; y < tilesY; y++) {
-		for (int x = 0; x < tilesX; x++) {
-			int srcOffset = x * 8 + y * 8 * (width);
-			DWORD *block = blocks + 64 * (x + y * tilesX);
-			CopyMemory(block, px + srcOffset, 32);
-			CopyMemory(block + 8, px + srcOffset + width, 32);
-			CopyMemory(block + 16, px + srcOffset + width * 2, 32);
-			CopyMemory(block + 24, px + srcOffset + width * 3, 32);
-			CopyMemory(block + 32, px + srcOffset + width * 4, 32);
-			CopyMemory(block + 40, px + srcOffset + width * 5, 32);
-			CopyMemory(block + 48, px + srcOffset + width * 6, 32);
-			CopyMemory(block + 56, px + srcOffset + width * 7, 32);
-			DWORD avg = averageColor(block, 64);
-			avgs[x + y * tilesX] = avg;
+	//if no write screen, still set some proper bounds.
+	if (!writeScreen) {
+		paletteNumber = 0;
+		if (ncgr->nBits == 4) {
+			nPalettes = nclr->nColors / 16;
+		} else {
+			nPalettes = 1;
 		}
 	}
 
+	*progressMax = tilesX * tilesY * 2;
+
+	BGTILE *blocks = (BGTILE *) calloc(tilesX * tilesY, sizeof(BGTILE));
+	COLOR32 *pals = (COLOR32 *) calloc(16 * maxPaletteSize, 4);
+
+	//split image into 8x8 chunks
+	for (int y = 0; y < tilesY; y++) {
+		for (int x = 0; x < tilesX; x++) {
+			int srcOffset = x * 8 + y * 8 * (width);
+			COLOR32 *block = blocks[x + y * tilesX].px;
+			memcpy(block, px + srcOffset, 32);
+			memcpy(block + 8, px + srcOffset + width, 32);
+			memcpy(block + 16, px + srcOffset + width * 2, 32);
+			memcpy(block + 24, px + srcOffset + width * 3, 32);
+			memcpy(block + 32, px + srcOffset + width * 4, 32);
+			memcpy(block + 40, px + srcOffset + width * 5, 32);
+			memcpy(block + 48, px + srcOffset + width * 6, 32);
+			memcpy(block + 56, px + srcOffset + width * 7, 32);
+		}
+	}
+
+	int charBase = tileBase;
+	int nscrTilesX = nscr->nWidth / 8;
+	int nscrTilesY = nscr->nHeight / 8;
+	uint16_t *nscrData = nscr->data;
+
+	//create dummy reduction to setup parameters for color matching
+	REDUCTION *reduction = (REDUCTION *) calloc(1, sizeof(REDUCTION));
+	initReduction(reduction, balance, colorBalance, 15, enhanceColors, paletteSize - !paletteOffset);
 
 	//generate an nPalettes color palette
 	if (newPalettes) {
-		createMultiplePalettes(px, tilesX, tilesY, pals, paletteNumber, nPalettes, paletteSize, paletteSize, 0, progress);
+		if (writeScreen) {
+			//if we're writing the screen, we can write the palette as normal.
+			createMultiplePalettesEx(px, tilesX, tilesY, pals, 0, nPalettes, maxPaletteSize, paletteSize, 
+				paletteOffset, balance, colorBalance, enhanceColors, progress);
+		} else {
+			//else, we need to be a bit more methodical. Lucky for us, though, the palettes are already partitioned.
+			//due to this, we can't respect user-set palette base and count. We're at the whim of the screen's
+			//existing data. Iterate all 16 palettes. If tiles in our region use them, construct a histogram and
+			//write its palette data.
+			//first read in original palette, we'll write over it.
+			for (int i = 0; i < nclr->nColors; i++) {
+				pals[i] = ColorConvertFromDS(nclr->colors[i]);
+			}
+			for (int palNo = 0; palNo < nPalettes; palNo++) {
+				int nTilesHistogram = 0;
+
+				for (int y = 0; y < tilesY; y++) {
+					for (int x = 0; x < tilesX; x++) {
+						uint16_t d = nscrData[x + nscrTileX + (y + nscrTileY) * nscrTilesX];
+						int thisPalNo = (d & 0xF000) >> 12;
+						if (thisPalNo != palNo) continue;
+
+						nTilesHistogram++;
+						computeHistogram(reduction, blocks[x + y * tilesX].px, 8, 8);
+					}
+				}
+
+				//if we counted tiles, create palette
+				if (nTilesHistogram > 0) {
+					flattenHistogram(reduction);
+					optimizePalette(reduction);
+					
+					COLOR32 *outPal = pals + palNo * maxPaletteSize + paletteOffset + !paletteOffset;
+					for (int i = 0; i < paletteSize - !paletteOffset; i++) {
+						uint8_t r = reduction->paletteRgb[i][0];
+						uint8_t g = reduction->paletteRgb[i][1];
+						uint8_t b = reduction->paletteRgb[i][2];
+						outPal[i] = r | (g << 8) | (b << 16);
+					}
+					qsort(outPal, paletteSize - !paletteOffset, sizeof(COLOR32), lightnessCompare);
+					if (paletteOffset == 0) pals[palNo * maxPaletteSize] = 0xFF00FF;
+					resetHistogram(reduction);
+				}
+			}
+		}
 	} else {
-		COLOR *destPalette = nclr->colors + paletteNumber * paletteSize;
+		COLOR *destPalette = nclr->colors + paletteNumber * maxPaletteSize;
 		int nColors = nPalettes * paletteSize;
 		for (int i = 0; i < nColors; i++) {
 			COLOR c = destPalette[i];
@@ -851,108 +988,226 @@ void nscrImportBitmap(NCLR *nclr, NCGR *ncgr, NSCR *nscr, DWORD *px, int width, 
 		}
 	}
 
-	int charBase = tileBase;
-
 	//write to NCLR
 	if (newPalettes) {
-		COLOR *destPalette = nclr->colors + paletteNumber * paletteSize;
+		COLOR *destPalette = nclr->colors + paletteNumber * maxPaletteSize;
 		for (int i = 0; i < nPalettes; i++) {
-			COLOR *dest = destPalette + i * paletteSize;
-			for (int j = 0; j < paletteSize; j++) {
-				DWORD col = (pals + i * paletteSize)[j];
+			COLOR *dest = destPalette + i * maxPaletteSize;
+			for (int j = paletteOffset; j < paletteOffset + paletteSize; j++) {
+				COLOR32 col = (pals + i * maxPaletteSize)[j];
 				dest[j] = ColorConvertToDS(col);
 			}
 		}
 	}
 
-	//next, start palette matching. See which palette best fits a tile, set it in the NSCR, then write the bits to the NCGR.
-	WORD *nscrData = nscr->data;
-	if (newCharacters) {
-		for (int y = 0; y < tilesY; y++) {
-			for (int x = 0; x < tilesX; x++) {
-				DWORD *block = blocks + 64 * (x + y * tilesX);
+	//pre-convert palette to YIQ
+	int *palsYiq = (int *) calloc(nPalettes * paletteSize, 4 * sizeof(int));
+	for (int i = 0; i < nPalettes * paletteSize; i++) {
+		rgbToYiq(pals[i], palsYiq + i * 4);
+	}
 
-				int leastError = 0x7FFFFFFF;
-				int leastIndex = 0;
-				for (int i = 0; i < nPalettes; i++) {
-					int err = getPaletteError((RGB*) block, 64, (RGB *) pals + i * paletteSize, paletteSize);
-					if (err < leastError) {
-						leastError = err;
-						leastIndex = i;
-					}
-				}
+	if (!writeScreen) {
+		//no write screen, only character can be written (palette was already dealt with)
+		if (newCharacters) {
+			//just write each tile
+			for (int y = 0; y < tilesY; y++) {
+				for (int x = 0; x < tilesX; x++) {
+					BGTILE *tile = blocks + x + y * tilesX;
 
-				int nscrX = x + nscrTileX;
-				int nscrY = y + nscrTileY;
+					uint16_t d = nscrData[x + nscrTileX + (y + nscrTileY) * nscrTilesX];
+					int charIndex = (d & 0x3FF) - charBase;
+					int palIndex = (d & 0xF000) >> 12;
+					int flip = (d & 0x0C00) >> 10;
+					if (charIndex < 0) continue;
+					
+					BYTE *chr = ncgr->tiles[charIndex];
+					COLOR32 *thisPalette = pals + palIndex * maxPaletteSize + paletteOffset + !paletteOffset;
+					ditherImagePaletteEx(tile->px, NULL, 8, 8, thisPalette, paletteSize - !paletteOffset, 
+						FALSE, TRUE, FALSE, dither ? diffuse : 0.0f, balance, colorBalance, enhanceColors);
+					for (int i = 0; i < 64; i++) {
+						COLOR32 c = tile->px[i];
+						int srcX = i % 8;
+						int srcY = i / 8;
+						int dstX = srcX ^ (flip & TILE_FLIPX ? 7 : 0);
+						int dstY = srcY ^ (flip & TILE_FLIPY ? 7 : 0);
 
-				WORD d = nscrData[nscrX + nscrY * (nscr->nWidth >> 3)];
-				d = d & 0xFFF;
-				d |= (leastIndex + paletteNumber) << 12;
-				nscrData[nscrX + nscrY * (nscr->nWidth >> 3)] = d;
-
-				int charOrigin = d & 0x3FF;
-				int ncgrX = charOrigin % ncgr->tilesX;
-				int ncgrY = charOrigin / ncgr->tilesX;
-				if (charOrigin - charBase < 0) continue;
-				BYTE *ncgrTile = ncgr->tiles[charOrigin - charBase];
-
-				if(dither) ditherImagePalette(block, 8, 8, pals + leastIndex * paletteSize, paletteSize - 1, FALSE, TRUE, TRUE, diffuse);
-				for (int i = 0; i < 64; i++) {
-					if ((block[i] & 0xFF000000) == 0) ncgrTile[i] = 0;
-					else {
-						int index = 1 + closestpalette(*(RGB *) &block[i], (RGB *) pals + leastIndex * paletteSize + 1, paletteSize - 1, NULL);
-						if (dither) {
-							RGB original = *(RGB *) &block[i];
-							RGB closest = ((RGB *) (pals + leastIndex * paletteSize))[index];
-							int er = closest.r - original.r;
-							int eg = closest.g - original.g;
-							int eb = closest.b - original.b;
-							doDiffuse(i, 8, 8, block, -er, -eg, -eb, 0, diffuse);
-						}
-						ncgrTile[i] = index;
+						int cidx = 0;
+						if ((c >> 24) >= 0x80) cidx = closestPalette(c, thisPalette, paletteSize - !paletteOffset) + paletteOffset + !paletteOffset;
+						chr[dstX + dstY * 8] = cidx;
 					}
 				}
 			}
 		}
-	} else {
-		for (int y = 0; y < tilesY; y++) {
-			for (int x = 0; x < tilesX; x++) {
-				DWORD *block = blocks + 64 * (x + y * tilesX);
+	} else if (writeCharacterIndices) {
+		//write screen, write character indices
+		//if we can write characters, do a normal character compression.
+		if (newCharacters) {
+			//do normal character compression.
+			setupBgTilesEx(blocks, tilesX * tilesY, ncgr->nBits, pals, paletteSize, nPalettes, 0, paletteOffset, 
+				dither, diffuse, balance, colorBalance, enhanceColors);
+			int nOutChars = performCharacterCompression(blocks, tilesX * tilesY, ncgr->nBits, nMaxChars, pals, paletteSize, 
+				nPalettes, paletteNumber, paletteOffset, balance, colorBalance, progress);
 
-				//find what combination of palette and character minimizes the error.
-				int chosenCharacter = 0, chosenPalette = 0, chosenFlip = TILE_FLIPNONE;
-				int minError = 0x7FFFFFFF;
-				for (int i = 0; i < nPalettes; i++) {
+			//keep track of master tiles and how they map to real character indices
+			int *masterMap = (int *) calloc(tilesX * tilesY, sizeof(int));
+
+			//write chars
+			int nCharsWritten = 0;
+			int indexMask = (1 << ncgr->nBits) - 1;
+			for (int i = 0; i < tilesX * tilesY; i++) {
+				BGTILE *tile = blocks + i;
+				if (tile->masterTile != i) continue;
+
+				//master tile
+				BYTE *destTile = ncgr->tiles[nCharsWritten + writeCharBase];
+				for (int j = 0; j < 64; j++)
+					destTile[j] = tile->indices[j] & indexMask;
+				masterMap[i] = nCharsWritten + writeCharBase;
+				nCharsWritten++;
+			}
+			
+			//next, write screen.
+			for (int y = 0; y < tilesY; y++) {
+				for (int x = 0; x < tilesX; x++) {
+					BGTILE *tile = blocks + x + y * tilesX;
+					int palette = tile->palette + paletteNumber;
+					int charIndex = masterMap[tile->masterTile] + charBase;
+
+					if (x + nscrTileX < nscrTilesX && y + nscrTileY < nscrTilesY) {
+						uint16_t d = (tile->flipMode << 10) | (palette << 12) | charIndex;
+						nscrData[x + nscrTileX + (y + nscrTileY) * (nscr->nWidth >> 3)] = d;
+					}
+				}
+			}
+			free(masterMap);
+		} else {
+			//else, we have to get by just using the screen itself.
+			for (int y = 0; y < tilesY; y++) {
+				for (int x = 0; x < tilesX; x++) {
+					BGTILE *tile = blocks + x + y * tilesX;
+					COLOR32 *block = tile->px;
+
+					//search best tile.
+					int chosenCharacter = 0, chosenPalette = 0, chosenFlip = TILE_FLIPNONE;
+					double minError = 1e32;
 					for (int j = 0; j < ncgr->nTiles; j++) {
-						int charId = j, mode;
-						int err = calculateBestPaletteCharError(block, pals + i * paletteSize, ncgr->tiles[charId], &mode, minError);
-						if (err < minError) {
-							chosenCharacter = charId;
-							chosenPalette = i;
-							minError = err;
-							chosenFlip = mode;
+						for (int i = 0; i < nPalettes; i++) {
+							int charId = j, mode;
+							double err = calculateBestPaletteCharError(reduction, block, palsYiq + i * maxPaletteSize * 4, ncgr->tiles[charId], &mode, minError);
+							if (err < minError) {
+								chosenCharacter = charId;
+								chosenPalette = i;
+								minError = err;
+								chosenFlip = mode;
+							}
+						}
+					}
+
+					int nscrX = x + nscrTileX;
+					int nscrY = y + nscrTileY;
+
+					if (nscrX < nscrTilesX && nscrY < nscrTilesY) {
+						uint16_t d = 0;
+						d = d & 0xFFF;
+						d |= (chosenPalette + paletteNumber) << 12;
+						d &= 0xFC00;
+						d |= (chosenCharacter + charBase);
+						d |= chosenFlip << 10;
+						nscrData[nscrX + nscrY * nscrTilesX] = d;
+					}
+				}
+			}
+		}
+
+	} else {
+		//write screen, no write character indices.
+		//next, start palette matching. See which palette best fits a tile, set it in the NSCR, then write the bits to the NCGR.
+		if (newCharacters) {
+			for (int y = 0; y < tilesY; y++) {
+				for (int x = 0; x < tilesX; x++) {
+					COLOR32 *block = blocks[x + y * tilesX].px;
+
+					double leastError = 1e32;
+					int leastIndex = 0;
+					for (int i = 0; i < nPalettes; i++) {
+						COLOR32 *thisPal = pals + i * maxPaletteSize + paletteOffset + !paletteOffset;
+						double err = computePaletteErrorYiq(reduction, block, 64, thisPal, paletteSize - !paletteOffset, 128, leastError);
+						if (err < leastError) {
+							leastError = err;
+							leastIndex = i;
+						}
+					}
+
+					int nscrX = x + nscrTileX;
+					int nscrY = y + nscrTileY;
+
+					if (nscrX < nscrTilesX && nscrY < nscrTilesY) {
+						uint16_t d = nscrData[nscrX + nscrY * nscrTilesX];
+						d = d & 0x3FF;
+						d |= (leastIndex + paletteNumber) << 12;
+						nscrData[nscrX + nscrY * (nscr->nWidth >> 3)] = d;
+
+						int charOrigin = d & 0x3FF;
+						if (charOrigin - charBase < 0) continue;
+						unsigned char *ncgrTile = ncgr->tiles[charOrigin - charBase];
+
+						COLOR32 *thisPal = pals + leastIndex * maxPaletteSize + paletteOffset + !paletteOffset;
+						ditherImagePaletteEx(block, NULL, 8, 8, thisPal, paletteSize - !paletteOffset, FALSE, TRUE, FALSE, dither ? diffuse : 0.0f,
+							balance, colorBalance, enhanceColors);
+						for (int i = 0; i < 64; i++) {
+							if ((block[i] & 0xFF000000) < 0x80) ncgrTile[i] = 0;
+							else {
+								int index = paletteOffset + !paletteOffset + closestPalette(block[i], thisPal, paletteSize - !paletteOffset);
+								ncgrTile[i] = index;
+							}
 						}
 					}
 				}
+			}
+		} else {
+			//no new character
+			for (int y = 0; y < tilesY; y++) {
+				for (int x = 0; x < tilesX; x++) {
+					COLOR32 *block = blocks[x + y * tilesX].px;
+					int nscrX = x + nscrTileX;
+					int nscrY = y + nscrTileY;
 
-				int nscrX = x + nscrTileX;
-				int nscrY = y + nscrTileY;
+					//check bounds
+					if (nscrX < nscrTilesX && nscrY < nscrTilesY) {
 
-				//WORD d = nscrData[nscrX + nscrY * (nscr->nWidth >> 3)];
-				WORD d = 0;
-				d = d & 0xFFF;
-				d |= (chosenPalette + paletteNumber) << 12;
-				d &= 0xFC00;
-				d |= (chosenCharacter + charBase);
-				d |= chosenFlip << 10;
-				nscrData[nscrX + nscrY * (nscr->nWidth >> 3)] = d;
+						//find what combination of palette and flip minimizes the error.
+						uint16_t oldData = nscrData[nscrX + nscrY * nscrTilesX];
+						int charId = (oldData & 0x3FF) - charBase, chosenPalette = 0, chosenFlip = TILE_FLIPNONE;
+						double minError = 1e32;
+						for (int i = 0; i < nPalettes; i++) {
+							int mode;
+							double err = calculateBestPaletteCharError(reduction, block, palsYiq + i * maxPaletteSize * 4, ncgr->tiles[charId], &mode, minError);
+							if (err < minError) {
+								chosenPalette = i;
+								minError = err;
+								chosenFlip = mode;
+							}
+						}
+
+						uint16_t d = 0;
+						d = d & 0xFFF;
+						d |= (chosenPalette + paletteNumber) << 12;
+						d &= 0xFC00;
+						d |= (charId + charBase);
+						d |= chosenFlip << 10;
+						nscrData[nscrX + nscrY * nscrTilesX] = d;
+					}
+				}
 			}
 		}
 	}
 
+	free(palsYiq);
+	destroyReduction(reduction);
+	free(reduction);
+
 	free(blocks);
 	free(pals);
-	free(avgs);
 }
 
 typedef struct {
@@ -965,14 +1220,23 @@ typedef struct {
 	int tileBase;
 	int nPalettes;
 	int paletteNumber;
+	int paletteSize;
+	int paletteOffset;
 	int newPalettes;
 	int newCharacters;
+	int charBase;
+	int nMaxChars;
 	int dither;
 	float diffuse;
 	int maxTilesX;
 	int maxTilesY;
 	int nscrTileX;
 	int nscrTileY;
+	int balance;
+	int colorBalance;
+	int enhanceColors;
+	int writeScreen;
+	int writeCharacterIndices;
 	HWND hWndNclrViewer;
 	HWND hWndNcgrViewer;
 	HWND hWndNscrViewer;
@@ -991,10 +1255,14 @@ void nscrImportCallback(void *data) {
 DWORD WINAPI threadedNscrImportBitmapInternal(LPVOID lpParameter) {
 	PROGRESSDATA *progressData = (PROGRESSDATA *) lpParameter;
 	NSCRIMPORTDATA *importData = (NSCRIMPORTDATA *) progressData->data;
-	nscrImportBitmap(importData->nclr, importData->ncgr, importData->nscr, importData->px,
-					 importData->width, importData->height, importData->tileBase, importData->nPalettes, importData->paletteNumber,
-					 importData->newPalettes, importData->newCharacters, importData->dither, importData->diffuse,
+	nscrImportBitmap(importData->nclr, importData->ncgr, importData->nscr, importData->px, importData->width, importData->height,
+					 importData->writeScreen, importData->writeCharacterIndices,
+					 importData->tileBase, importData->nPalettes, importData->paletteNumber,
+					 importData->paletteOffset, importData->paletteSize,
+					 importData->newPalettes, importData->charBase, importData->nMaxChars,
+					 importData->newCharacters, importData->dither, importData->diffuse,
 					 importData->maxTilesX, importData->maxTilesY, importData->nscrTileX, importData->nscrTileY,
+					 importData->balance, importData->colorBalance, importData->enhanceColors,
 					 &progressData->progress1, &progressData->progress1Max);
 	progressData->waitOn = 1;
 	return 0;
@@ -1002,6 +1270,32 @@ DWORD WINAPI threadedNscrImportBitmapInternal(LPVOID lpParameter) {
 
 void threadedNscrImportBitmap(PROGRESSDATA *param) {
 	CreateThread(NULL, 0, threadedNscrImportBitmapInternal, param, 0, NULL);
+}
+
+void nscrBitmapImportUpdate(HWND hWnd) {
+	NSCRBITMAPIMPORTDATA *data = (NSCRBITMAPIMPORTDATA *) GetWindowLongPtr(hWnd, 0);
+	int dither = SendMessage(data->hWndDitherCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	int writeChars = SendMessage(data->hWndNewCharactersCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	int writeScreen = SendMessage(data->hWndWriteScreenCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+	int writeCharIndices = SendMessage(data->hWndWriteCharIndicesCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+	setStyle(data->hWndDitherCheckbox, !writeChars, WS_DISABLED);
+
+	//diffuse input only enabled when dithering enabled
+	setStyle(data->hWndDiffuseAmount, !dither || !writeChars, WS_DISABLED);
+
+	//write character indices only enabled when writing screen
+	setStyle(data->hWndWriteCharIndicesCheckbox, !writeScreen, WS_DISABLED);
+
+	//character base and count only enabled when overwriting character indices and writing screen
+	setStyle(data->hWndCharacterBase, !writeChars || !writeCharIndices || !writeScreen, WS_DISABLED);
+	setStyle(data->hWndCharacterCount, !writeChars || !writeCharIndices || !writeScreen, WS_DISABLED);
+
+	//if not overwriting screen, palette base and count are invalid
+	setStyle(data->hWndPaletteInput, !writeScreen, WS_DISABLED);
+	setStyle(data->hWndPalettesInput, !writeScreen, WS_DISABLED);
+
+	InvalidateRect(hWnd, NULL, FALSE);
 }
 
 LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1013,6 +1307,19 @@ LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 	switch (msg) {
 		case WM_CREATE:
 		{
+			int boxWidth = 100 + 100 + 10 + 10 + 10; //box width
+			int boxHeight = 2 * 27 - 5 + 10 + 10 + 10; //first row height
+			int boxHeight2 = 27 * 5 - 5 + 10 + 10 + 10; //second row height
+			int boxHeight3 = 3 * 27 - 5 + 10 + 10 + 10; //third row height
+			int width = 30 + 2 * boxWidth; //window width
+			int height = 42 + boxHeight + 10 + boxHeight2 + 10 + boxHeight3 + 10 + 22 + 10; //window height
+
+			int leftX = 10 + 10; //left box X
+			int rightX = 10 + boxWidth + 10 + 10; //right box X
+			int topY = 42 + 10 + 8; //top box Y
+			int middleY = 42 + boxHeight + 10 + 10 + 8; //middle box Y
+			int bottomY = 42 + boxHeight + 10 + boxHeight2 + 10 + 10 + 8; //bottom box Y
+
 			HWND hWndParent = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
 			SetWindowLong(hWndParent, GWL_STYLE, GetWindowLong(hWndParent, GWL_STYLE) | WS_DISABLED);
 			/*
@@ -1024,35 +1331,88 @@ LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 			
 			*/
 
-			CreateWindow(L"STATIC", L"Bitmap:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 10, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Palette:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 37, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Palettes:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 64, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Dither:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 91, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Diffuse:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 118, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Create new palette:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 145, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Overwrite characters:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 172, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Bitmap:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 10, 50, 22, hWnd, NULL, NULL, NULL);
+			data->hWndBitmapName = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 70, 10, width - 10 - 50 - 70, 22, hWnd, NULL, NULL, NULL);
+			data->hWndBrowseButton = CreateWindow(L"BUTTON", L"...", WS_VISIBLE | WS_CHILD, width - 10 - 50, 10, 50, 22, hWnd, NULL, NULL, NULL);
 
-			data->hWndBitmapName = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 120, 10, 200, 22, hWnd, NULL, NULL, NULL);
-			data->hWndBrowseButton = CreateWindow(L"BUTTON", L"...", WS_VISIBLE | WS_CHILD, 320, 10, 25, 22, hWnd, NULL, NULL, NULL);
-			data->hWndPaletteInput = CreateWindow(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST, 120, 37, 100, 200, hWnd, NULL, NULL, NULL);
-			data->hWndPalettesInput = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_NUMBER, 120, 64, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndDitherCheckbox = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 91, 22, 22, hWnd, NULL, NULL, NULL);
-			data->hWndDiffuseAmount = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"100", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 120, 118, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndImportButton = CreateWindow(L"BUTTON", L"Import", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 120, 199, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndNewPaletteCheckbox = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 145, 22, 22, hWnd, NULL, NULL, NULL);
-			data->hWndNewCharactersCheckbox = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 172, 22, 22, hWnd, NULL, NULL, NULL);
+			data->hWndWriteScreenCheckbox = CreateWindow(L"BUTTON", L"Overwrite Screen", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, leftX, topY, 150, 22, hWnd, NULL, NULL, NULL);
+			data->hWndWriteCharIndicesCheckbox = CreateWindow(L"BUTTON", L"Overwrite Character Indices", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, leftX, topY + 27, 150, 22, hWnd, NULL, NULL, NULL);
+
+			data->hWndNewPaletteCheckbox = CreateWindow(L"BUTTON", L"Overwrite Palette", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, leftX, middleY, 150, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Palettes:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX, middleY + 27, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndPalettesInput = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_NUMBER, leftX + 85, middleY + 27, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Base:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX, middleY + 27 * 2, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndPaletteInput = CreateWindow(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST, leftX + 85, middleY + 27 * 2, 100, 200, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Size:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX, middleY + 27 * 3, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndPaletteSize = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"16", WS_VISIBLE | WS_CHILD | ES_NUMBER, leftX + 85, middleY + 27 * 3, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Offset:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX, middleY + 27 * 4, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndPaletteOffset = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER, leftX + 85, middleY + 27 * 4, 100, 22, hWnd, NULL, NULL, NULL);
+
+			data->hWndNewCharactersCheckbox = CreateWindow(L"BUTTON", L"Overwrite Character", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, rightX, middleY, 150, 22, hWnd, NULL, NULL, NULL);
+			data->hWndDitherCheckbox = CreateWindow(L"BUTTON", L"Dither", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, rightX, middleY + 27, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Diffuse:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, rightX, middleY + 27 * 2, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndDiffuseAmount = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"100", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, rightX + 85, middleY + 27 * 2, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Base:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, rightX, middleY + 27 * 3, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndCharacterBase = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER, rightX + 85, middleY + 27 * 3, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Count:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, rightX, middleY + 27 * 4, 75, 22, hWnd, NULL, NULL, NULL);
+			data->hWndCharacterCount = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1024", WS_VISIBLE | WS_CHILD | ES_NUMBER, rightX + 85, middleY + 27 * 4, 100, 22, hWnd, NULL, NULL, NULL);
+
+			CreateWindow(L"STATIC", L"Balance:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX, bottomY, 100, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Color Balance:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX, bottomY + 27, 100, 22, hWnd, NULL, NULL, NULL);
+			data->hWndEnhanceColors = CreateWindow(L"BUTTON", L"Enhance Colors", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, leftX, bottomY + 27 * 2, 200, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Lightness", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE | SS_RIGHT, leftX + 110, bottomY, 50, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Color", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX + 110 + 50 + 200, bottomY, 50, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Green", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE | SS_RIGHT, leftX + 110, bottomY + 27, 50, 22, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"STATIC", L"Red", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, leftX + 110 + 50 + 200, bottomY + 27, 50, 22, hWnd, NULL, NULL, NULL);
+			data->hWndBalance = CreateWindow(TRACKBAR_CLASS, L"", WS_VISIBLE | WS_CHILD, leftX + 110 + 50, bottomY, 200, 22, hWnd, NULL, NULL, NULL);
+			data->hWndColorBalance = CreateWindow(TRACKBAR_CLASS, L"", WS_VISIBLE | WS_CHILD, leftX + 110 + 50, bottomY + 27, 200, 22, hWnd, NULL, NULL, NULL);
+
+
+			data->hWndImportButton = CreateWindow(L"BUTTON", L"Import", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, width / 2 - 100, height - 32, 200, 22, hWnd, NULL, NULL, NULL);
+
+			CreateWindow(L"BUTTON", L"Screen", WS_VISIBLE | WS_CHILD | BS_GROUPBOX, leftX - 10, topY - 18, rightX + boxWidth - leftX, boxHeight, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"BUTTON", L"Palette", WS_VISIBLE | WS_CHILD | BS_GROUPBOX, leftX - 10, middleY - 18, boxWidth, boxHeight2, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"BUTTON", L"Graphics", WS_VISIBLE | WS_CHILD | BS_GROUPBOX, rightX - 10, middleY - 18, boxWidth, boxHeight2, hWnd, NULL, NULL, NULL);
+			CreateWindow(L"BUTTON", L"Color", WS_VISIBLE | WS_CHILD | BS_GROUPBOX, leftX - 10, bottomY - 18, rightX + boxWidth - leftX, boxHeight3, hWnd, NULL, NULL, NULL);
 
 			for (int i = 0; i < 16; i++) {
 				WCHAR textBuffer[4];
 				wsprintf(textBuffer, L"%d", i);
 				SendMessage(data->hWndPaletteInput, CB_ADDSTRING, wcslen(textBuffer), (LPARAM) textBuffer);
 			}
+			SendMessage(data->hWndWriteScreenCheckbox, BM_SETCHECK, 1, 0);
 			SendMessage(data->hWndDitherCheckbox, BM_SETCHECK, 1, 0);
 			SendMessage(data->hWndNewPaletteCheckbox, BM_SETCHECK, 1, 0);
 			SendMessage(data->hWndNewCharactersCheckbox, BM_SETCHECK, 1, 0);
+			SendMessage(data->hWndBalance, TBM_SETRANGE, TRUE, BALANCE_MIN | (BALANCE_MAX << 16));
+			SendMessage(data->hWndBalance, TBM_SETPOS, TRUE, BALANCE_DEFAULT);
+			SendMessage(data->hWndColorBalance, TBM_SETRANGE, TRUE, BALANCE_MIN | (BALANCE_MAX << 16));
+			SendMessage(data->hWndColorBalance, TBM_SETPOS, TRUE, BALANCE_DEFAULT);
 
-			SetWindowSize(hWnd, 355, 231);
+			setStyle(data->hWndCharacterBase, TRUE, WS_DISABLED);
+			setStyle(data->hWndCharacterCount, TRUE, WS_DISABLED);
+
+			SetWindowSize(hWnd, width, height);
 			EnumChildWindows(hWnd, SetFontProc, (LPARAM) GetStockObject(DEFAULT_GUI_FONT));
+			break;
+		}
+		case NV_INITIALIZE:
+		{
+			HWND hWndEditor = (HWND) lParam;
+			HWND hWndMain = getMainWindow(hWndEditor);
+			HWND hWndNcgrEditor = NULL;
+			GetAllEditors(hWndMain, FILE_TYPE_CHARACTER, &hWndNcgrEditor, 1);
+			NCGRVIEWERDATA *ncgrViewerData = (NCGRVIEWERDATA *) GetWindowLongPtr(hWndNcgrEditor, 0);
+			NCGR *ncgr = &ncgrViewerData->ncgr;
+
+			//set appropriate fields using data from NCGR
+			WCHAR bf[16];
+			int len = wsprintfW(bf, L"%d", ncgr->nBits == 4 ? 16 : 256);
+			SendMessage(data->hWndPaletteSize, WM_SETTEXT, len, (LPARAM) bf);
+			len = wsprintfW(bf, L"%d", ncgr->nTiles);
+			SendMessage(data->hWndCharacterCount, WM_SETTEXT, len, (LPARAM) bf);
+
+			data->hWndEditor = hWndEditor;
 			break;
 		}
 		case NV_INITIMPORTDIALOG:
@@ -1090,20 +1450,37 @@ LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 					SendMessage(data->hWndDiffuseAmount, WM_GETTEXT, (WPARAM) MAX_PATH, (LPARAM) textBuffer);
 					float diffuse = ((float) _wtoi(textBuffer)) * 0.01f;
 
+					SendMessage(data->hWndCharacterBase, WM_GETTEXT, (WPARAM) MAX_PATH, (LPARAM) textBuffer);
+					int characterBase = _wtoi(textBuffer);
+					SendMessage(data->hWndCharacterCount, WM_GETTEXT, (WPARAM) MAX_PATH, (LPARAM) textBuffer);
+					int characterCount = _wtoi(textBuffer);
+
 					SendMessage(data->hWndPalettesInput, WM_GETTEXT, (WPARAM) MAX_PATH, (LPARAM) textBuffer);
 					int nPalettes = _wtoi(textBuffer);
+					SendMessage(data->hWndPaletteSize, WM_GETTEXT, (WPARAM) MAX_PATH, (LPARAM) textBuffer);
+					int paletteSize = _wtoi(textBuffer);
+					SendMessage(data->hWndPaletteOffset, WM_GETTEXT, (WPARAM) MAX_PATH, (LPARAM) textBuffer);
+					int paletteOffset = _wtoi(textBuffer);
 					if (nPalettes > 16) nPalettes = 16;
+
 					int paletteNumber = SendMessage(data->hWndPaletteInput, CB_GETCURSEL, 0, 0);
 					int dither = SendMessage(data->hWndDitherCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
 					int newPalettes = SendMessage(data->hWndNewPaletteCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
 					int newCharacters = SendMessage(data->hWndNewCharactersCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+					int balance = SendMessage(data->hWndBalance, TBM_GETPOS, 0, 0);
+					int colorBalance = SendMessage(data->hWndColorBalance, TBM_GETPOS, 0, 0);
+					int enhanceColors = SendMessage(data->hWndEnhanceColors, BM_GETCHECK, 0, 0) == BST_CHECKED;
+					int writeCharacterIndices = SendMessage(data->hWndWriteCharIndicesCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+					int writeScreen = SendMessage(data->hWndWriteScreenCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+					if (!writeScreen) writeCharacterIndices = 0;
 
 					HWND hWndMain = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
 					NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 					HWND hWndNcgrViewer = nitroPaintStruct->hWndNcgrViewer;
 					NCGRVIEWERDATA *ncgrViewerData = (NCGRVIEWERDATA *) GetWindowLongPtr(hWndNcgrViewer, 0);
 					NCGR *ncgr = &ncgrViewerData->ncgr;
-					HWND hWndNscrViewer = nitroPaintStruct->hWndNscrViewer;
+					HWND hWndNscrViewer = data->hWndEditor;
 					NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
 					NSCR *nscr = &nscrViewerData->nscr;
 					HWND hWndNclrViewer = nitroPaintStruct->hWndNclrViewer;
@@ -1124,12 +1501,20 @@ LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 					nscrImportData->tileBase = nscrViewerData->tileBase;
 					nscrImportData->nPalettes = nPalettes;
 					nscrImportData->paletteNumber = paletteNumber;
+					nscrImportData->paletteOffset = paletteOffset;
+					nscrImportData->paletteSize = paletteSize;
 					nscrImportData->newPalettes = newPalettes;
 					nscrImportData->newCharacters = newCharacters;
+					nscrImportData->charBase = characterBase;
+					nscrImportData->nMaxChars = characterCount;
 					nscrImportData->dither = dither;
 					nscrImportData->diffuse = diffuse;
+					nscrImportData->balance = balance;
+					nscrImportData->colorBalance = colorBalance;
 					nscrImportData->maxTilesX = maxTilesX;
 					nscrImportData->maxTilesY = maxTilesY;
+					nscrImportData->writeCharacterIndices = writeCharacterIndices;
+					nscrImportData->writeScreen = writeScreen;
 					nscrImportData->nscrTileX = data->nscrTileX;
 					nscrImportData->nscrTileY = data->nscrTileY;
 					nscrImportData->hWndNclrViewer = hWndNclrViewer;
@@ -1144,6 +1529,14 @@ LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 					SendMessage(hWnd, WM_CLOSE, 0, 0);
 					SetActiveWindow(hWndProgress);
 					SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) | WS_DISABLED);
+				} else if (hWndControl == data->hWndWriteCharIndicesCheckbox) {
+					nscrBitmapImportUpdate(hWnd);
+				} else if (hWndControl == data->hWndWriteScreenCheckbox) {
+					nscrBitmapImportUpdate(hWnd);
+				} else if (hWndControl == data->hWndDitherCheckbox) {
+					nscrBitmapImportUpdate(hWnd);
+				} else if (hWndControl == data->hWndNewCharactersCheckbox) {
+					nscrBitmapImportUpdate(hWnd);
 				}
 			}
 			break;
@@ -1152,7 +1545,7 @@ LRESULT WINAPI NscrBitmapImportWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 		{
 			HWND hWndParent = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
 			SetWindowLong(hWndParent, GWL_STYLE, GetWindowLong(hWndParent, GWL_STYLE) & ~WS_DISABLED);
-			SetFocus(hWndParent);
+			SetActiveWindow(hWndParent);
 			break;
 		}
 		case WM_DESTROY:

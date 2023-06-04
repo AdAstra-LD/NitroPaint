@@ -1,6 +1,8 @@
 #pragma once
 #include <Windows.h>
 
+#include "ui.h"
+
 typedef struct {
 	int contentWidth;
 	int contentHeight;
@@ -15,6 +17,8 @@ typedef struct {
 BOOL __stdcall SetFontProc(HWND hWnd, LPARAM lParam);
 
 VOID UpdateScrollbarVisibility(HWND hWnd);
+
+VOID ScaleInterface(HWND hWnd, float scale);
 
 VOID DestroyChild(HWND hWnd);
 

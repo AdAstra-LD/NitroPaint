@@ -1,3 +1,6 @@
+#include <Windows.h>
+#include <CommCtrl.h>
+
 #include "ncgrviewer.h"
 #include "nclrviewer.h"
 #include "nscrviewer.h"
@@ -8,6 +11,7 @@
 #include "gdip.h"
 #include "palette.h"
 #include "tileeditor.h"
+#include "ui.h"
 
 extern HICON g_appIcon;
 
@@ -121,10 +125,40 @@ VOID PaintNcgrViewer(HWND hWnd, NCGRVIEWERDATA *data, HDC hDC, int xMin, int yMi
 	free(px);
 }
 
-#define NV_INITIALIZE (WM_USER+1)
-#define NV_RECALCULATE (WM_USER+2)
-#define NV_INITIALIZE_IMMEDIATE (WM_USER+3)
-#define NV_SETTITLE (WM_USER+4)
+void ncgrExportImage(NCGR *ncgr, NCLR *nclr, int paletteIndex, LPCWSTR path) {
+	//convert to bitmap layout
+	int tilesX = ncgr->tilesX, tilesY = ncgr->tilesY;
+	int width = tilesX * 8, height = tilesY * 8;
+	unsigned char *bits = (unsigned char *) calloc(width * height, 1);
+	for (int tileY = 0; tileY < tilesY; tileY++) {
+		for (int tileX = 0; tileX < tilesX; tileX++) {
+			BYTE *tile = ncgr->tiles[tileX + tileY * tilesX];
+			for (int y = 0; y < 8; y++) {
+				memcpy(bits + tileX * 8 + (tileY * 8 + y) * width, tile + y * 8, 8);
+			}
+		}
+	}
+
+	//convert palette
+	int depth = ncgr->nBits;
+	int paletteSize = 1 << depth;
+	int paletteStart = paletteIndex << depth;
+	if (paletteStart + paletteSize > nclr->nColors) {
+		paletteSize = nclr->nColors - paletteStart;
+	}
+	if (paletteSize < 0) paletteSize = 0;
+	COLOR32 *pal = (COLOR32 *) calloc(paletteSize, sizeof(COLOR32));
+	for (int i = 0; i < paletteSize; i++) {
+		COLOR32 c = ColorConvertFromDS(nclr->colors[paletteStart + i]);
+		if (i) c |= 0xFF000000;
+		pal[i] = c;
+	}
+
+	imageWriteIndexed(bits, width, height, pal, paletteSize, path);
+
+	free(bits);
+	free(pal);
+}
 
 typedef struct CHARIMPORTDATA_ {
 	WCHAR path[MAX_PATH];
@@ -142,6 +176,9 @@ typedef struct CHARIMPORTDATA_ {
 	HWND hWndCompression;
 	HWND hWndMaxChars;
 	HWND hWndImport;
+	HWND hWndBalance;
+	HWND hWndColorBalance;
+	HWND hWndEnhanceColors;
 } CHARIMPORTDATA;
 
 LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -166,12 +203,12 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			data->hWnd = hWnd;
 
 			data->hWndViewer = CreateWindow(L"NcgrPreviewClass", L"", WS_VISIBLE | WS_CHILD | WS_HSCROLL | WS_VSCROLL, 0, 0, 256, 256, hWnd, NULL, NULL, NULL);
-			data->hWndCharacterLabel = CreateWindow(L"STATIC", L" Character 0", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 0, 0, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndPaletteDropdown = CreateWindowEx(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST, 0, 0, 200, 100, hWnd, NULL, NULL, NULL);
-			data->hWndWidthDropdown = CreateWindowEx(WS_EX_CLIENTEDGE, L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_HASSTRINGS | CBS_DROPDOWNLIST, 0, 0, 200, 100, hWnd, NULL, NULL, NULL);
-			data->hWndWidthLabel = CreateWindow(L"STATIC", L" Width:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 0, 0, 100, 21, hWnd, NULL, NULL, NULL);
-			data->hWndExpand = CreateWindow(L"BUTTON", L"Extend", WS_CHILD | WS_VISIBLE, 0, 0, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWnd8bpp = CreateWindow(L"BUTTON", L"8bpp", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 0, 0, 100, 22, hWnd, NULL, NULL, NULL);
+			data->hWndCharacterLabel = CreateStatic(hWnd, L" Character 0", 0, 0, 100, 22);
+			data->hWndPaletteDropdown = CreateCombobox(hWnd, NULL, 0, 0, 0, 200, 100, 0);
+			data->hWndWidthDropdown = CreateCombobox(hWnd, NULL, 0, 0, 0, 200, 100, 0);
+			data->hWndWidthLabel = CreateStatic(hWnd, L" Width:", 0, 0, 100, 21);
+			data->hWndExpand = CreateButton(hWnd, L"Extend", 0, 0, 100, 22, FALSE);
+			data->hWnd8bpp = CreateCheckbox(hWnd, L"8bpp", 0, 0, 100, 22, FALSE);
 
 			WCHAR bf[] = L"Palette 00";
 			for (int i = 0; i < 16; i++) {
@@ -182,8 +219,9 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 			//read config data
 			if (!g_configuration.ncgrViewerConfiguration.gridlines) {
+				HWND hWndMain = getMainWindow(hWnd);
 				data->showBorders = 0;
-				CheckMenuItem(GetMenu((HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT)), ID_VIEW_GRIDLINES, MF_UNCHECKED);
+				CheckMenuItem(GetMenu(hWndMain), ID_VIEW_GRIDLINES, MF_UNCHECKED);
 			}
 			break;
 		}
@@ -212,15 +250,10 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			data->frameData.contentWidth = getDimension(data->ncgr.tilesX, data->showBorders, data->scale);
 			data->frameData.contentHeight = getDimension(data->ncgr.tilesY, data->showBorders, data->scale);
 
-			RECT rc = { 0 };
-			rc.right = data->frameData.contentWidth;
-			rc.bottom = data->frameData.contentHeight;
-			if (rc.right < 255 + GetSystemMetrics(SM_CXVSCROLL) + 4) rc.right = 255 + GetSystemMetrics(SM_CXVSCROLL) + 4; //+4 to account for WS_EX_CLIENTEDGE
-			AdjustWindowRect(&rc, WS_CAPTION | WS_THICKFRAME | WS_SYSMENU, FALSE);
-			int width = rc.right - rc.left;
-			int height = rc.bottom - rc.top + 4 + 42 + 22 + GetSystemMetrics(SM_CYHSCROLL); //+42 to account for combobox
-			width += 1, height += 1;
-			SetWindowPos(hWnd, HWND_TOP, 0, 0, width, height, SWP_NOMOVE);
+			int width = data->frameData.contentWidth + GetSystemMetrics(SM_CXVSCROLL) + 4;
+			int height = data->frameData.contentHeight + 4 + 42 + 22 + GetSystemMetrics(SM_CYHSCROLL); //+42 to account for combobox;
+			if (width < 255 + 4) width = 255 + 4; //min width for controls
+			SetWindowSize(hWnd, width, height);
 
 
 			int nTiles = data->ncgr.nTiles;
@@ -237,18 +270,24 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			}
 			if (data->ncgr.nBits == 8) SendMessage(data->hWnd8bpp, BM_SETCHECK, 1, 0);
 
-			//guess a tile base based on an open NCGR (if any)
-			HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
-			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-			HWND hWndNscrViewer = nitroPaintStruct->hWndNscrViewer;
-			if (hWndNscrViewer) {
-				NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
-				NSCR *nscr = &nscrViewerData->nscr;
-				if (nscr->nHighestIndex >= data->ncgr.nTiles) {
-					NscrViewerSetTileBase(hWndNscrViewer, nscr->nHighestIndex + 1 - data->ncgr.nTiles);
-				} else {
-					NscrViewerSetTileBase(hWndNscrViewer, 0);
+			//guess a tile base for open NSCR (if any)
+			HWND hWndMain = getMainWindow(hWnd);
+			int nNscrEditors = GetAllEditors(hWndMain, FILE_TYPE_SCREEN, NULL, 0);
+			if (nNscrEditors > 0) {
+				//for each editor
+				HWND *nscrEditors = (HWND *) calloc(nNscrEditors, sizeof(HWND));
+				GetAllEditors(hWndMain, FILE_TYPE_SCREEN, nscrEditors, nNscrEditors);
+				for (int i = 0; i < nNscrEditors; i++) {
+					HWND hWndNscrViewer = nscrEditors[i];
+					NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
+					NSCR *nscr = &nscrViewerData->nscr;
+					if (nscr->nHighestIndex >= data->ncgr.nTiles) {
+						NscrViewerSetTileBase(hWndNscrViewer, nscr->nHighestIndex + 1 - data->ncgr.nTiles);
+					} else {
+						NscrViewerSetTileBase(hWndNscrViewer, 0);
+					}
 				}
+				free(nscrEditors);
 			}
 			break;
 		}
@@ -270,8 +309,7 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					int selected = SendMessage(hWndControl, CB_GETCURSEL, 0, 0);
 					SendMessage(hWndControl, CB_GETLBTEXT, (WPARAM) selected, (LPARAM) text);
 					int width = _wtol(text);
-					data->ncgr.tilesX = width;
-					data->ncgr.tilesY = data->ncgr.nTiles / width;
+					ncgrChangeWidth(&data->ncgr, width);
 
 					RECT rcClient;
 					GetClientRect(hWnd, &rcClient);
@@ -284,10 +322,10 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 										  CW_USEDEFAULT, CW_USEDEFAULT, 500, 500, hWndMain, NULL, NULL, NULL);
 					ShowWindow(h, SW_SHOW);
 					SetActiveWindow(h);
-					SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) | WS_DISABLED);
+					setStyle(hWndMain, TRUE, WS_DISABLED);
 					SendMessage(h, NV_INITIALIZE, 0, (LPARAM) data);
 				} else if (notification == BN_CLICKED && hWndControl == data->hWnd8bpp) {
-					int state = SendMessage(hWndControl, BM_GETCHECK, 0, 0) == BST_CHECKED;
+					int state = GetCheckboxChecked(hWndControl);
 					if (state) {
 						//convert 4bpp graphic to 8bpp
 
@@ -365,7 +403,7 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					}
 
 					InvalidateRect(hWnd, NULL, FALSE);
-					HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
+					HWND hWndMain = getMainWindow(hWnd);
 					NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 					if (nitroPaintStruct->hWndNclrViewer) {
 						InvalidateRect(nitroPaintStruct->hWndNclrViewer, NULL, FALSE);
@@ -470,6 +508,9 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 								case NCGR_TYPE_COMBO:
 									filter = L"Combination Files (*.dat, *.bnr, *.bin)\0*.dat;*.bnr;*.bin\0";
 									break;
+								case NCGR_TYPE_NC:
+									filter = L"NCG Files (*.ncg)\0*.ncg\0All Files\0*.*\0";
+									break;
 							}
 							LPWSTR path = saveFileDialog(getMainWindow(hWnd), L"Save As...", filter, L"ncgr");
 							if (path != NULL) {
@@ -485,7 +526,6 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					{
 						LPWSTR location = saveFileDialog(hWnd, L"Save Bitmap", L"PNG Files (*.png)\0*.png\0All Files\0*.*\0", L"png");
 						if (!location) break;
-						int width, height;
 
 						HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
 						NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
@@ -501,10 +541,7 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						}
 						ncgr = &data->ncgr;
 
-						DWORD * bits = renderNcgrBits(ncgr, nclr, FALSE, FALSE, &width, &height, -1, -1, data->selectedPalette, data->transparent);
-
-						writeImage(bits, width, height, location);
-						free(bits);
+						ncgrExportImage(ncgr, nclr, data->selectedPalette, location);
 						free(location);
 						break;
 					}
@@ -621,6 +658,8 @@ LRESULT WINAPI NcgrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			MoveWindow(data->hWnd8bpp, 155, height - 21, 100, 21, TRUE);
 			return DefMDIChildProc(hWnd, msg, wParam, lParam);
 		}
+		case NV_GETTYPE:
+			return FILE_TYPE_CHAR;
 	}
 	return DefChildProc(hWnd, msg, wParam, lParam);
 }
@@ -686,9 +725,8 @@ LRESULT WINAPI NcgrPreviewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 			DeleteObject(hBitmap);
 			if (data->hWndTileEditorWindow) InvalidateRect(data->hWndTileEditorWindow, NULL, FALSE);
 
-			HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWndNcgrViewer, GWL_HWNDPARENT), GWL_HWNDPARENT);
-			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLong(hWndMain, 0);
-			if (nitroPaintStruct->hWndNscrViewer) InvalidateRect(nitroPaintStruct->hWndNscrViewer, NULL, FALSE);
+			HWND hWndMain = getMainWindow(hWndNcgrViewer);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
 
 			InvalidateRect(data->hWndWidthLabel, NULL, FALSE);
 			break;
@@ -814,7 +852,7 @@ LRESULT WINAPI NcgrPreviewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 			data->hoverY = hoverY;
 			data->hoverIndex = hoverIndex;
 			if (data->hoverIndex != oldHovered) {
-				HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWndNcgrViewer, GWL_HWNDPARENT), GWL_HWNDPARENT);
+				HWND hWndMain = getMainWindow(hWndNcgrViewer);
 				NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLong(hWndMain, 0);
 				if (nitroPaintStruct->hWndNcgrViewer) InvalidateRect(nitroPaintStruct->hWndNcgrViewer, NULL, FALSE);
 			}
@@ -877,9 +915,9 @@ LRESULT CALLBACK NcgrExpandProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WCHAR buffer[16];
 			wsprintfW(buffer, L"%d", data->ncgr.nTiles / data->ncgr.tilesX);
 
-			CreateWindow(L"STATIC", L"Rows:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 10, 75, 22, hWnd, NULL, NULL, NULL);
-			data->hWndExpandRowsInput = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", buffer, WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_NUMBER, 90, 10, 75, 22, hWnd, NULL, NULL, NULL);
-			data->hWndExpandButton = CreateWindow(L"BUTTON", L"Set", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 90, 37, 75, 22, hWnd, NULL, NULL, NULL);
+			CreateStatic(hWnd, L"Rows:", 10, 10, 75, 22);
+			data->hWndExpandRowsInput = CreateEdit(hWnd, buffer, 90, 10, 75, 22, TRUE);
+			data->hWndExpandButton = CreateButton(hWnd, L"Set", 90, 37, 75, 22, TRUE);
 			EnumChildWindows(hWnd, SetFontProc, (LPARAM) GetStockObject(DEFAULT_GUI_FONT));
 			SetWindowSize(hWnd, 175, 69);
 			SetFocus(data->hWndExpandRowsInput);
@@ -887,8 +925,8 @@ LRESULT CALLBACK NcgrExpandProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 		}
 		case WM_CLOSE:
 		{
-			HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(data->hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
-			SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) & ~WS_DISABLED);
+			HWND hWndMain = getMainWindow(data->hWnd);
+			setStyle(hWndMain, FALSE, WS_DISABLED);
 			SetActiveWindow(hWndMain);
 			break;
 		}
@@ -897,10 +935,8 @@ LRESULT CALLBACK NcgrExpandProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			int notification = LOWORD(wParam);
 			HWND hWndControl = (HWND) lParam;
 			if (notification == BN_CLICKED && hWndControl == data->hWndExpandButton) {
-				WCHAR buffer[16];
-				SendMessage(data->hWndExpandRowsInput, WM_GETTEXT, 16, (LPARAM) buffer);
 				int tilesX = data->ncgr.tilesX;
-				int nRows = _wtol(buffer);
+				int nRows = GetEditNumber(data->hWndExpandRowsInput);
 				int nOldRows = data->ncgr.nTiles / tilesX;
 				if (nRows > nOldRows) {
 					BYTE **chars = data->ncgr.tiles;
@@ -939,6 +975,9 @@ typedef struct {
 	int originX;
 	int originY;
 	int paletteNumber;
+	int balance;
+	int colorBalance;
+	int enhanceColors;
 	NCLR *nclr;
 	NCGR *ncgr;
 	HWND hWndMain;
@@ -948,23 +987,20 @@ typedef struct {
 int charImportCallback(void *data) {
 	CHARIMPORT *cim = (CHARIMPORT *) data;
 	HWND hWndMain = cim->hWndMain;
-	NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-	HWND hWndNclrViewer = nitroPaintStruct->hWndNclrViewer;
-	HWND hWndNcgrViewer = nitroPaintStruct->hWndNcgrViewer;
-	HWND hWndNscrViewer = nitroPaintStruct->hWndNscrViewer;
-	HWND hWndNcerViewer = nitroPaintStruct->hWndNcerViewer;
-	if (hWndNclrViewer != NULL) InvalidateRect(hWndNclrViewer, NULL, FALSE);
-	if (hWndNcgrViewer != NULL) InvalidateRect(hWndNcgrViewer, NULL, FALSE);
-	if (hWndNscrViewer != NULL) InvalidateRect(hWndNscrViewer, NULL, FALSE);
-	if (hWndNcerViewer != NULL) InvalidateRect(hWndNcerViewer, NULL, FALSE);
+	InvalidateAllEditors(hWndMain, FILE_TYPE_PALETTE);
+	InvalidateAllEditors(hWndMain, FILE_TYPE_CHAR);
+	InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
+	InvalidateAllEditors(hWndMain, FILE_TYPE_CELL);
 	free(data);
 
-	SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) & ~WS_DISABLED);
+	setStyle(hWndMain, FALSE, WS_DISABLED);
 	SetForegroundWindow(hWndMain);
 	return 0;
 }
 
-void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int paletteNumber, int paletteSize, int paletteBase, BOOL dither, float diffuse, BOOL import1D, BOOL charCompression, int nMaxChars, int originX, int originY, int *progress) {
+void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int paletteNumber, int paletteSize, int paletteBase, 
+	BOOL dither, float diffuse, BOOL import1D, BOOL charCompression, int nMaxChars, int originX, int originY, 
+	int balance, int colorBalance, int enhanceColors, int *progress) {
 	int maxPaletteSize = 1 << ncgr->nBits;
 
 	//if we start at base 0, increment by 1. We'll put a placeholder color in slot 0.
@@ -981,24 +1017,24 @@ void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int
 	}
 
 	COLOR *nitroPalette = nclr->colors + firstColorIndex;
-	DWORD *palette = (DWORD *) calloc(paletteSize, 4);
+	COLOR32 *palette = (COLOR32 *) calloc(paletteSize, 4);
 
 	int width, height;
-	DWORD *pixels = gdipReadImage(imgPath, &width, &height);
+	COLOR32 *pixels = gdipReadImage(imgPath, &width, &height);
 
 	//if we use an existing palette, decode the palette values.
 	//if we do not use an existing palette, generate one.
 	if (!createPalette) {
 		//decode the palette
 		for (int i = 0; i < paletteSize; i++) {
-			DWORD col = ColorConvertFromDS(nitroPalette[i]);
+			COLOR32 col = ColorConvertFromDS(nitroPalette[i]);
 			palette[i] = col;
 		}
 	} else {
 		//create a palette, then encode them to the nclr
-		createPaletteExact(pixels, width, height, palette, paletteSize);
+		createPaletteSlowEx(pixels, width, height, palette, paletteSize, balance, colorBalance, enhanceColors, 0);
 		for (int i = 0; i < paletteSize; i++) {
-			DWORD d = palette[i];
+			COLOR32 d = palette[i];
 			COLOR ds = ColorConvertToDS(d);
 			nitroPalette[i] = ds;
 			palette[i] = ColorConvertFromDS(ds);
@@ -1007,7 +1043,7 @@ void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int
 
 	//index image with given parameters.
 	if (!dither) diffuse = 0.0f;
-	ditherImagePalette(pixels, width, height, palette, paletteSize, 0, 1, 0, diffuse);
+	ditherImagePaletteEx(pixels, NULL, width, height, palette, paletteSize, 0, 1, 0, diffuse, balance, colorBalance, enhanceColors);
 
 	//now, write out indices. 
 	int originOffset = originX + originY * ncgr->tilesX;
@@ -1025,16 +1061,16 @@ void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int
 		for (int y = 0; y < tilesY; y++) {
 			for (int x = 0; x < tilesX; x++) {
 				int offset = (y + originY) * ncgr->tilesX + x + originX;
-				BYTE * tile = ncgr->tiles[offset];
+				BYTE *tile = ncgr->tiles[offset];
 
 				//write out this tile using the palette. Diffuse any error accordingly.
 				for (int i = 0; i < 64; i++) {
 					int offsetX = i & 0x7;
 					int offsetY = i >> 3;
 					int poffset = x * 8 + offsetX + (y * 8 + offsetY) * width;
-					DWORD pixel = pixels[poffset];
+					COLOR32 pixel = pixels[poffset];
 
-					int closest = closestpalette(*(RGB *) &pixel, (RGB *) palette, paletteSize, NULL) + paletteBase;
+					int closest = closestPalette(pixel, palette, paletteSize) + paletteBase;
 					if ((pixel >> 24) < 127) closest = 0;
 					tile[i] = closest;
 				}
@@ -1068,15 +1104,16 @@ void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int
 			for (int y = 0; y < tilesY; y++) {
 				for (int x = 0; x < tilesX; x++) {
 					int srcOffset = x * 8 + y * 8 * (width);
-					DWORD *block = bgTiles[x + y * tilesX].px;
+					COLOR32 *block = bgTiles[x + y * tilesX].px;
 
 					int index = x + y * tilesX;
 					memcpy(block, tiles + index * 64, 64 * 4);
 				}
 			}
 			int nTiles = nChars;
-			setupBgTiles(bgTiles, nChars, ncgr->nBits, dummyFull, paletteSize, 1, 0, paletteBase, 0, 0.0f);
-			nChars = performCharacterCompression(bgTiles, nChars, ncgr->nBits, nMaxChars, dummyFull, paletteSize, 1, 0, paletteBase, progress);
+			setupBgTilesEx(bgTiles, nChars, ncgr->nBits, dummyFull, paletteSize, 1, 0, paletteBase, 0, 0.0f, balance, colorBalance, enhanceColors);
+			nChars = performCharacterCompression(bgTiles, nChars, ncgr->nBits, nMaxChars, dummyFull, paletteSize, 1, 0, paletteBase, 
+				balance, colorBalance, progress);
 
 			//read back result
 			int outIndex = 0;
@@ -1105,7 +1142,7 @@ void charImport(NCLR *nclr, NCGR *ncgr, LPCWSTR imgPath, BOOL createPalette, int
 			for (int j = 0; j < 64; j++) {
 				COLOR32 pixel = srcTile[j];
 
-				int closest = closestpalette(*(RGB *) &pixel, (RGB *) palette, paletteSize, NULL) + paletteBase;
+				int closest = closestPalette(pixel, palette, paletteSize) + paletteBase;
 				if ((pixel >> 24) < 127) closest = 0;
 				tile[j] = closest;
 			}
@@ -1124,7 +1161,8 @@ DWORD WINAPI charImportInternal(LPVOID lpParameter) {
 	progress->progress1 = 100;
 	progress->progress2Max = 1000;
 	charImport(cim->nclr, cim->ncgr, cim->imgPath, cim->createPalette, cim->paletteNumber, cim->paletteSize, cim->paletteBase, 
-			   cim->dither, cim->diffuse, cim->import1D, cim->charCompression, cim->nMaxChars, cim->originX, cim->originY, &progress->progress2);
+			   cim->dither, cim->diffuse, cim->import1D, cim->charCompression, cim->nMaxChars, cim->originX, cim->originY, 
+			   cim->balance, cim->colorBalance, cim->enhanceColors, &progress->progress2);
 	progress->waitOn = 1;
 	return 0;
 }
@@ -1142,32 +1180,58 @@ LRESULT CALLBACK CharImportProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 	switch (msg) {
 		case WM_CREATE:
 		{
-			CreateWindow(L"STATIC", L"Overwrite palette:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 10, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Palette base:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 42, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Palette size:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 74, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Dither:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 106, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Diffuse:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 138, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"1D import:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 170, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Compress character:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 202, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Max chars:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 202 + 32, 100, 22, hWnd, NULL, NULL, NULL);
+			int boxWidth = 100 + 100 + 10 + 10 + 10; //box width
+			int boxHeight = 3 * 27 - 5 + 10 + 10 + 10; //first row height
+			int boxHeight2 = 3 * 27 - 5 + 10 + 10 + 10; //second row height
+			int boxHeight3 = 3 * 27 - 5 + 10 + 10 + 10; //third row height
+			int width = 30 + 2 * boxWidth; //window width
+			int height = 10 + boxHeight + 10 + boxHeight2 + 10 + boxHeight3 + 10 + 22 + 10; //window height
 
-			data->hWndOverwritePalette = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 10, 22, 22, hWnd, NULL, NULL, NULL);
-			data->hWndPaletteBase = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"0", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 120, 42, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndPaletteSize = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"256", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 120, 74, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndDither = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 106, 22, 22, hWnd, NULL, NULL, NULL);
-			data->hWndDiffuse = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"100", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 120, 138, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWnd1D = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 170, 22, 22, hWnd, NULL, NULL, NULL);
-			data->hWndCompression = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 202, 22, 22, hWnd, NULL, NULL, NULL);
-			data->hWndMaxChars = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1024", WS_VISIBLE | WS_CHILD | ES_NUMBER | ES_AUTOHSCROLL, 120, 202 + 32, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndImport = CreateWindow(L"BUTTON", L"Import", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 120, 234 + 32, 100, 22, hWnd, NULL, NULL, NULL);
+			int leftX = 10 + 10; //left box X
+			int rightX = 10 + boxWidth + 10 + 10; //right box X
+			int topY = 10 + 10 + 8; //top box Y
+			int middleY = 10 + boxHeight + 10 + 10 + 8; //middle box Y
+			int bottomY = 10 + boxHeight + 10 + boxHeight2 + 10 + 10 + 8; //bottom box Y
+
+			data->hWndOverwritePalette = CreateCheckbox(hWnd, L"Write Palette", leftX, topY, 150, 22, FALSE);
+			CreateStatic(hWnd, L"Palette Base:", leftX, topY + 27, 75, 22);
+			data->hWndPaletteBase = CreateEdit(hWnd, L"0", leftX + 85, topY + 27, 100, 22, TRUE);
+			CreateStatic(hWnd, L"Palette Size:", leftX, topY + 27 * 2, 75, 22);
+			data->hWndPaletteSize = CreateEdit(hWnd, L"256", leftX + 85, topY + 27 * 2, 100, 22, TRUE);
+
+			data->hWndDither = CreateCheckbox(hWnd, L"Dither", rightX, topY, 150, 22, FALSE);
+			CreateStatic(hWnd, L"Diffuse:", rightX, topY + 27, 75, 22);
+			data->hWndDiffuse = CreateEdit(hWnd, L"100", rightX + 85, topY + 27, 100, 22, TRUE);
+
+			data->hWnd1D = CreateCheckbox(hWnd, L"1D Import", leftX, middleY, 150, 22, FALSE);
+			data->hWndCompression = CreateCheckbox(hWnd, L"Compress Character", leftX, middleY + 27, 150, 22, FALSE);
+			CreateStatic(hWnd, L"Max Chars:", leftX, middleY + 27 * 2, 75, 22);
+			data->hWndMaxChars = CreateEdit(hWnd, L"1024", leftX + 85, middleY + 27 * 2, 100, 22, TRUE);
+
+			CreateStatic(hWnd, L"Balance:", leftX, bottomY, 100, 22);
+			CreateStatic(hWnd, L"Color Balance:", leftX, bottomY + 27, 100, 22);
+			data->hWndEnhanceColors = CreateCheckbox(hWnd, L"Enhance Colors", leftX, bottomY + 27 * 2, 200, 22, FALSE);
+			CreateStaticAligned(hWnd, L"Lightness", leftX + 110, bottomY, 50, 22, SCA_RIGHT);
+			CreateStaticAligned(hWnd, L"Color", leftX + 110 + 50 + 200, bottomY, 50, 22, SCA_LEFT);
+			CreateStaticAligned(hWnd, L"Green", leftX + 110, bottomY + 27, 50, 22, SCA_RIGHT);
+			CreateStaticAligned(hWnd, L"Red", leftX + 110 + 50 + 200, bottomY + 27, 50, 22, SCA_LEFT);
+			data->hWndBalance = CreateTrackbar(hWnd, leftX + 110 + 50, bottomY, 200, 22, BALANCE_MIN, BALANCE_MAX, BALANCE_DEFAULT);
+			data->hWndColorBalance = CreateTrackbar(hWnd, leftX + 110 + 50, bottomY + 27, 200, 22, BALANCE_MIN, BALANCE_MAX, BALANCE_DEFAULT);
+
+			data->hWndImport = CreateButton(hWnd, L"Import", width / 2 - 100, height - 32, 200, 22, TRUE);
+
+			CreateGroupbox(hWnd, L"Palette", 10, 10, boxWidth, boxHeight);
+			CreateGroupbox(hWnd, L"Graphics", 10 + boxWidth + 10, 10, boxWidth, boxHeight);
+			CreateGroupbox(hWnd, L"Dimension", 10, 10 + boxHeight + 10, boxWidth * 2 + 10, boxHeight2);
+			CreateGroupbox(hWnd, L"Color", 10, 10 + boxHeight + 10 + boxHeight2 + 10, 10 + 2 * boxWidth, boxHeight3);
 
 			HWND hWndMain = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
 			EnumChildWindows(hWnd, SetFontProc, (LPARAM) (HFONT) GetStockObject(DEFAULT_GUI_FONT));
-			SetWindowSize(hWnd, 230, 266 + 32);
-			SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) | WS_DISABLED);
-			SetWindowLong(data->hWndDiffuse, GWL_STYLE, GetWindowLong(data->hWndDiffuse, GWL_STYLE) | WS_DISABLED);
-			SetWindowLong(data->hWndCompression, GWL_STYLE, GetWindowLong(data->hWndCompression, GWL_STYLE) | WS_DISABLED);
-			SetWindowLong(data->hWndMaxChars, GWL_STYLE, GetWindowLong(data->hWndMaxChars, GWL_STYLE) | WS_DISABLED);
+			setStyle(hWndMain, TRUE, WS_DISABLED);
+			setStyle(data->hWndDiffuse, TRUE, WS_DISABLED);
+			setStyle(data->hWndCompression, TRUE, WS_DISABLED);
+			setStyle(data->hWndMaxChars, TRUE, WS_DISABLED);
+			SetWindowSize(hWnd, width, height);
 			break;
 		}
 		case WM_COMMAND:
@@ -1175,41 +1239,37 @@ LRESULT CALLBACK CharImportProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			HWND hWndControl = (HWND) lParam;
 			if (hWndControl != NULL) {
 				if (hWndControl == data->hWndDither) {
-					int state = SendMessage(hWndControl, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					if (state) SetWindowLong(data->hWndDiffuse, GWL_STYLE, GetWindowLong(data->hWndDiffuse, GWL_STYLE) & ~WS_DISABLED);
-					else SetWindowLong(data->hWndDiffuse, GWL_STYLE, GetWindowLong(data->hWndDiffuse, GWL_STYLE) | WS_DISABLED);
+					int state = GetCheckboxChecked(hWndControl);
+					setStyle(data->hWndDiffuse, !state, WS_DISABLED);
 					InvalidateRect(hWnd, NULL, TRUE);
 				} else if (hWndControl == data->hWnd1D) {
-					int state = SendMessage(hWndControl, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					int ccState = SendMessage(data->hWndCompression, BM_GETCHECK, 0, 0) == BST_CHECKED;
+					int state = GetCheckboxChecked(hWndControl);
+					int ccState = GetCheckboxChecked(data->hWndCompression);
 					if (state) {
-						SetWindowLong(data->hWndCompression, GWL_STYLE, GetWindowLong(data->hWndCompression, GWL_STYLE) & ~WS_DISABLED);
-						if (ccState) SetWindowLong(data->hWndMaxChars, GWL_STYLE, GetWindowLong(data->hWndMaxChars, GWL_STYLE) & ~WS_DISABLED);
+						setStyle(data->hWndCompression, FALSE, WS_DISABLED);
+						if (ccState) setStyle(data->hWndMaxChars, FALSE, WS_DISABLED);
 					} else {
-						SetWindowLong(data->hWndCompression, GWL_STYLE, GetWindowLong(data->hWndCompression, GWL_STYLE) | WS_DISABLED);
-						SetWindowLong(data->hWndMaxChars, GWL_STYLE, GetWindowLong(data->hWndMaxChars, GWL_STYLE) | WS_DISABLED);
+						setStyle(data->hWndCompression, TRUE, WS_DISABLED);
+						setStyle(data->hWndMaxChars, TRUE, WS_DISABLED);
 					}
 					InvalidateRect(hWnd, NULL, TRUE);
 				} else if(hWndControl == data->hWndCompression){
-					int state = SendMessage(hWndControl, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					if (state) SetWindowLong(data->hWndMaxChars, GWL_STYLE, GetWindowLong(data->hWndMaxChars, GWL_STYLE) & ~WS_DISABLED);
-					else SetWindowLong(data->hWndMaxChars, GWL_STYLE, GetWindowLong(data->hWndMaxChars, GWL_STYLE) | WS_DISABLED);
+					int state = GetCheckboxChecked(hWndControl);
+					setStyle(data->hWndMaxChars, !state, WS_DISABLED);
 					InvalidateRect(hWnd, NULL, TRUE);
 				} else if (hWndControl == data->hWndImport) {
-					BOOL createPalette = SendMessage(data->hWndOverwritePalette, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					BOOL dither = SendMessage(data->hWndDither, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					BOOL import1D = SendMessage(data->hWnd1D, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					BOOL charCompression = SendMessage(data->hWndCompression, BM_GETCHECK, 0, 0) == BST_CHECKED;
-					WCHAR inBuffer[16];
-					SendMessage(data->hWndDiffuse, WM_GETTEXT, 16, (LPARAM) inBuffer);
-					float diffuse = ((float) _wtol(inBuffer)) / 100.0f;
+					BOOL createPalette = GetCheckboxChecked(data->hWndOverwritePalette);
+					BOOL dither = GetCheckboxChecked(data->hWndDither);
+					BOOL import1D = GetCheckboxChecked(data->hWnd1D);
+					BOOL charCompression = GetCheckboxChecked(data->hWndCompression);
+					float diffuse = ((float) GetEditNumber(data->hWndDiffuse)) / 100.0f;
 					if (!dither) diffuse = 0.0f;
-					SendMessage(data->hWndPaletteBase, WM_GETTEXT, 16, (LPARAM) inBuffer);
-					int paletteBase = _wtol(inBuffer);
-					SendMessage(data->hWndPaletteSize, WM_GETTEXT, 16, (LPARAM) inBuffer);
-					int paletteSize = _wtol(inBuffer);
-					SendMessage(data->hWndMaxChars, WM_GETTEXT, 16, (LPARAM) inBuffer);
-					int nMaxChars = _wtol(inBuffer);
+					int paletteBase = GetEditNumber(data->hWndPaletteBase);
+					int paletteSize = GetEditNumber(data->hWndPaletteSize);
+					int nMaxChars = GetEditNumber(data->hWndMaxChars);
+					int balance = GetTrackbarPosition(data->hWndBalance);
+					int colorBalance = GetTrackbarPosition(data->hWndColorBalance);
+					BOOL enhanceColors = GetCheckboxChecked(data->hWndEnhanceColors);
 
 					NCLR *nclr = data->nclr;
 					NCGR *ncgr = data->ncgr;
@@ -1230,6 +1290,9 @@ LRESULT CALLBACK CharImportProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 					cimport->originX = data->contextHoverX;
 					cimport->originY = data->contextHoverY;
 					cimport->paletteNumber = data->selectedPalette;
+					cimport->balance = balance;
+					cimport->colorBalance = colorBalance;
+					cimport->enhanceColors = enhanceColors;
 					cimport->hWndMain = hWndMain;
 					memcpy(cimport->imgPath, data->path, 2 * (wcslen(data->path) + 1));
 					progressData->data = cimport;
@@ -1237,7 +1300,7 @@ LRESULT CALLBACK CharImportProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 					HWND hWndProgress = CreateWindow(L"ProgressWindowClass", L"In Progress...", WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_THICKFRAME), CW_USEDEFAULT, CW_USEDEFAULT, 300, 100, hWndMain, NULL, NULL, NULL);
 					ShowWindow(hWndProgress, SW_SHOW);
-					SendMessage(hWndProgress, WM_USER + 2, 0, (LPARAM) progressData);
+					SendMessage(hWndProgress, NV_SETDATA, 0, (LPARAM) progressData);
 					threadedCharImport(progressData);
 
 					DestroyWindow(hWnd);
@@ -1248,7 +1311,7 @@ LRESULT CALLBACK CharImportProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 		case WM_CLOSE:
 		{
 			HWND hWndMain = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
-			SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) & ~WS_DISABLED);
+			setStyle(hWndMain, FALSE, WS_DISABLED);
 			SetForegroundWindow(hWndMain);
 			break;
 		}

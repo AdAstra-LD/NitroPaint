@@ -108,8 +108,6 @@ int ncerRead(NCER *ncer, char *buffer, int size) {
 				char *cellData = buffer + *(DWORD *) (buffer + 4);
 				
 				DWORD mappingMode = *(DWORD *) (buffer + 8);
-				char *vramTransferData = *(char **) (buffer + 12);
-				if (vramTransferData) vramTransferData += (DWORD_PTR) buffer;
 
 				int perCellDataSize = 8;
 				if (ncer->bankAttribs == 1) perCellDataSize += 8;
@@ -145,6 +143,17 @@ int ncerRead(NCER *ncer, char *buffer, int size) {
 					}
 
 					cellData += perCellDataSize;
+				}
+
+				//VRAM transfer
+				uint32_t vramTransferOffset = *(uint32_t *) (buffer + 0xC);
+				if (vramTransferOffset) {
+					unsigned char *vramTransferData = (buffer + vramTransferOffset);
+					uint32_t maxTransfer = *(uint32_t *) (vramTransferData);
+					uint32_t transferDataOffset = vramTransferOffset + *(uint32_t *) (vramTransferData + 4);
+
+					ncer->vramTransfer = (NCER_VRAM_TRANSFER_ENTRY *) calloc(ncer->nCells, sizeof(NCER_VRAM_TRANSFER_ENTRY));
+					memcpy(ncer->vramTransfer, buffer + transferDataOffset, ncer->nCells * sizeof(NCER_VRAM_TRANSFER_ENTRY));
 				}
 
 				break;
@@ -227,14 +236,14 @@ int decodeAttributesEx(NCER_CELL_INFO *info, NCER_CELL *cell, int oam) {
 	info->characterBits = 4;
 	if (is8) {
 		info->characterBits = 8;
-		info->palette = 0;
+		//info->palette = 0;
 		//info->characterName <<= 1;
 	}
 
 	return 0;
 }
 
-void ncerCellToBitmap2(NCER_CELL_INFO *info, NCGR *ncgr, NCLR *nclr, DWORD *out, int *width, int *height, int checker) {
+void ncerCellToBitmap2(NCER_CELL_INFO *info, NCGR *ncgr, NCLR *nclr, NCER_VRAM_TRANSFER_ENTRY *vramTransfer, DWORD *out, int *width, int *height, int checker) {
 	*width = info->width;
 	*height = info->height;
 
@@ -242,24 +251,36 @@ void ncerCellToBitmap2(NCER_CELL_INFO *info, NCGR *ncgr, NCLR *nclr, DWORD *out,
 	int tilesY = *height / 8;
 
 	if (ncgr != NULL) {
+		int charSize = ncgr->nBits * 8;
 		int ncgrStart = NCGR_BOUNDARY(ncgr, info->characterName);
 		for (int y = 0; y < tilesY; y++) {
 			for (int x = 0; x < tilesX; x++) {
 				DWORD block[64];
 
 				int bitsOffset = x * 8 + (y * 8 * tilesX * 8);
+				int index;
 				if (NCGR_2D(ncgr->mappingMode)) {
-					int startX = ncgrStart % ncgr->tilesX;
-					int startY = ncgrStart / ncgr->tilesX;
-					int ncx = x + startX;
-					int ncy = y + startY;
-					ncgrGetTile(ncgr, nclr, ncx, ncy, block, info->palette, checker, TRUE);
+					int ncx = x + ncgrStart % ncgr->tilesX;
+					int ncy = y + ncgrStart / ncgr->tilesX;
+					index = ncx + ncgr->tilesX * ncy;
 				} else {
-					int index = ncgrStart + x + y * tilesX;
-					int ncx = index % ncgr->tilesX;
-					int ncy = index / ncgr->tilesX;
-					ncgrGetTile(ncgr, nclr, ncx, ncy, block, info->palette, checker, TRUE);
+					index = ncgrStart + x + y * tilesX;
 				}
+
+				if (vramTransfer != NULL) {
+					int transferDest = 0, transferSize = vramTransfer->size;
+					int transferSrc = vramTransfer->offset;
+
+					//simulate a VRAM transfer to VRAM at offset 0
+					//do this by adding transferSrc to our character address
+					if (index * charSize < transferDest + transferSize) {
+						index += transferSrc / charSize;
+					}
+				}
+
+				int ncx = index % ncgr->tilesX;
+				int ncy = index / ncgr->tilesX;
+				ncgrGetTile(ncgr, nclr, ncx, ncy, block, info->palette, checker, TRUE);
 				for (int i = 0; i < 8; i++) {
 					memcpy(out + bitsOffset + tilesX * 8 * i, block + i * 8, 32);
 				}
@@ -272,18 +293,22 @@ DWORD *ncerCellToBitmap(NCER_CELL_INFO *info, NCGR *ncgr, NCLR *nclr, int *width
 	*width = info->width;
 	*height = info->height;
 	DWORD *bits = calloc(*width * *height, 4);
-	ncerCellToBitmap2(info, ncgr, nclr, bits, width, height, checker);
+	ncerCellToBitmap2(info, ncgr, nclr, NULL, bits, width, height, checker);
 	return bits;
 }
 
 DWORD *ncerRenderWholeCell2(DWORD *px, NCER_CELL *cell, NCGR *ncgr, NCLR *nclr, int xOffs, int yOffs, int checker, int outline) {
+	return ncerRenderWholeCell3(px, cell, ncgr, nclr, NULL, xOffs, yOffs, checker, outline, 1.0f, 0.0f, 0.0f, 1.0f);
+}
+
+DWORD *ncerRenderWholeCell3(DWORD *px, NCER_CELL *cell, NCGR *ncgr, NCLR *nclr, NCER_VRAM_TRANSFER_ENTRY *vramTransfer, int xOffs, int yOffs, int checker, int outline, float a, float b, float c, float d) {
 	DWORD *block = (DWORD *) calloc(64 * 64, 4);
 	for (int i = cell->nAttribs - 1; i >= 0; i--) {
 		NCER_CELL_INFO info;
 		int entryWidth, entryHeight;
 		decodeAttributesEx(&info, cell, i);
 
-		ncerCellToBitmap2(&info, ncgr, nclr, block, &entryWidth, &entryHeight, 0);
+		ncerCellToBitmap2(&info, ncgr, nclr, vramTransfer, block, &entryWidth, &entryHeight, 0);
 
 		//HV flip? Only if not affine!
 		if (!info.rotateScale) {
@@ -316,13 +341,42 @@ DWORD *ncerRenderWholeCell2(DWORD *px, NCER_CELL *cell, NCGR *ncgr, NCLR *nclr, 
 				y += info.height / 2;
 			}
 			//copy data
-			for (int j = 0; j < info.height; j++) {
-				int _y = (y + j + yOffs) & 0xFF;
-				for (int k = 0; k < info.width; k++) {
-					int _x = (x + k + xOffs) & 0x1FF;
-					DWORD col = block[j * info.width + k];
-					if (col >> 24) {
-						px[_x + _y * 512] = block[j * info.width + k];
+			if (!info.rotateScale) {
+				for (int j = 0; j < info.height; j++) {
+					int _y = (y + j + yOffs) & 0xFF;
+					for (int k = 0; k < info.width; k++) {
+						int _x = (x + k + xOffs) & 0x1FF;
+						DWORD col = block[j * info.width + k];
+						if (col >> 24) {
+							px[_x + _y * 512] = block[j * info.width + k];
+						}
+					}
+				}
+			} else {
+				//transform about center
+				int realWidth = info.width << info.doubleSize;
+				int realHeight = info.height << info.doubleSize;
+				int cx = realWidth / 2;
+				int cy = realHeight / 2;
+				int realX = x - (realWidth - info.width) / 2;
+				int realY = y - (realHeight - info.height) / 2;
+				for (int j = 0; j < realHeight; j++) {
+					int destY = (realY + j + yOffs) & 0xFF;
+					for (int k = 0; k < realWidth; k++) {
+						int destX = (realX + k + xOffs) & 0x1FF;
+
+						int srcX = (int) ((k - cx) * a + (j - cy) * b) + cx;
+						int srcY = (int) ((k - cx) * c + (j - cy) * d) + cy;
+
+						if (info.doubleSize) {
+							srcX -= realWidth / 4;
+							srcY -= realHeight / 4;
+						}
+						if (srcX >= 0 && srcY >= 0 && srcX < info.width && srcY < info.height) {
+							DWORD src = block[srcY * info.width + srcX];
+							if(src >> 24) px[destX + destY * 512] = src;
+						}
+
 					}
 				}
 			}
@@ -385,6 +439,7 @@ int ncerFree(OBJECT_HEADER *header) {
 		free(ncer->cells[i].attr);
 	}
 	if (ncer->cells) free(ncer->cells);
+	if (ncer->vramTransfer) free(ncer->vramTransfer);
 	
 	return 0;
 }
@@ -420,7 +475,7 @@ int ncerWrite(NCER *ncer, BSTREAM *stream) {
 			, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 		*(WORD *) (kbecHeader + 8) = ncer->nCells;
 		*(WORD *) (kbecHeader + 10) = attr;
-		*(DWORD *) (kbecHeader + 4) = kbecSize;
+		*(DWORD *) (kbecHeader + 4) = (kbecSize + 3) & ~3;
 
 		bstreamWrite(stream, kbecHeader, sizeof(kbecHeader));
 
@@ -449,18 +504,29 @@ int ncerWrite(NCER *ncer, BSTREAM *stream) {
 			bstreamWrite(stream, cell->attr, cell->nAttr * 2);
 		}
 
+		//align
+		uint32_t endPos = stream->pos;
+		uint32_t zero = 0;
+		if (stream->pos & 3) {
+			bstreamWrite(stream, &zero, 4 - (stream->pos & 3));
+		}
+
 		if (hasLabl) {
 			BYTE lablHeader[] = {'L', 'B', 'A', 'L', 0, 0, 0, 0};
 			*(DWORD *) (lablHeader + 4) = ncer->lablSize + 8;
 			bstreamWrite(stream, lablHeader, sizeof(lablHeader));
 			bstreamWrite(stream, ncer->labl, ncer->lablSize);
+			endPos = stream->pos;
 		}
 		if (hasUext) {
 			BYTE uextHeader[] = {'T', 'X', 'E', 'U', 0, 0, 0, 0};
 			*(DWORD *) (uextHeader + 4) = ncer->uextSize + 8;
 			bstreamWrite(stream, uextHeader, sizeof(uextHeader));
 			bstreamWrite(stream, ncer->uext, ncer->uextSize);
+			endPos = stream->pos;
 		}
+		bstreamSeek(stream, 8, 0);
+		bstreamWrite(stream, &endPos, sizeof(endPos));
 
 	} else {
 		bstreamWrite(stream, &ncer->nCells, 4);

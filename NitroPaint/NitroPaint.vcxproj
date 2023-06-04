@@ -123,10 +123,11 @@
       <StringPooling>true</StringPooling>
       <ExceptionHandling>false</ExceptionHandling>
       <BufferSecurityCheck>false</BufferSecurityCheck>
-      <CompileAs>CompileAsC</CompileAs>
+      <CompileAs>Default</CompileAs>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <WholeProgramOptimization>false</WholeProgramOptimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -137,7 +138,7 @@
       <RandomizedBaseAddress>false</RandomizedBaseAddress>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
       <AdditionalOptions>/EMITPOGOPHASEINFO /PDBALTPATH:NitroPaint.pdb %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>C:\users\patri_000\Documents\tcc\asm\lib\msvcrt-light.lib;uxtheme.lib;version.lib;gdiplus.lib;comctl32.lib;dbghelp.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>C:\users\patri_000\Documents\tcc\asm\lib\msvcrt-light.lib;uxtheme.lib;version.lib;windowscodecs.lib;comctl32.lib;dbghelp.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <DelayLoadDLLs>dbghelp.dll</DelayLoadDLLs>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -160,7 +161,9 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="analysis.c" />
+    <ClCompile Include="analysis.c">
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">CompileAsC</CompileAs>
+    </ClCompile>
     <ClCompile Include="bstream.c" />
     <ClCompile Include="childwindow.c" />
     <ClCompile Include="color.c" />
@@ -181,16 +184,20 @@
     <ClCompile Include="nclr.c" />
     <ClCompile Include="nclrviewer.c" />
     <ClCompile Include="nitropaint.c" />
+    <ClCompile Include="nmcr.c" />
+    <ClCompile Include="nmcrviewer.c" />
     <ClCompile Include="nsbtx.c" />
     <ClCompile Include="nsbtxviewer.c" />
     <ClCompile Include="nscr.c" />
     <ClCompile Include="nscrviewer.c" />
     <ClCompile Include="palette.c" />
+    <ClCompile Include="palops.c" />
     <ClCompile Include="texconv.c" />
     <ClCompile Include="texture.c" />
     <ClCompile Include="textureeditor.c" />
     <ClCompile Include="tileeditor.c" />
     <ClCompile Include="tiler.c" />
+    <ClCompile Include="ui.c" />
     <ClCompile Include="undo.c" />
   </ItemGroup>
   <ItemGroup>
@@ -214,17 +221,21 @@
     <ClInclude Include="nclr.h" />
     <ClInclude Include="nclrviewer.h" />
     <ClInclude Include="nitropaint.h" />
+    <ClInclude Include="nmcr.h" />
+    <ClInclude Include="nmcrviewer.h" />
     <ClInclude Include="nsbtx.h" />
     <ClInclude Include="nsbtxviewer.h" />
     <ClInclude Include="nscr.h" />
     <ClInclude Include="nscrviewer.h" />
     <ClInclude Include="palette.h" />
+    <ClInclude Include="palops.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="texconv.h" />
     <ClInclude Include="texture.h" />
     <ClInclude Include="textureeditor.h" />
     <ClInclude Include="tileeditor.h" />
     <ClInclude Include="tiler.h" />
+    <ClInclude Include="ui.h" />
     <ClInclude Include="undo.h" />
   </ItemGroup>
   <ItemGroup>

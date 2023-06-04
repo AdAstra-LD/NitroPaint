@@ -1,6 +1,7 @@
 #pragma once
 #include <Windows.h>
 #include "nclr.h"
+#include "palops.h"
 
 typedef struct {
 	int contentWidth;
@@ -26,6 +27,9 @@ typedef struct {
 	int draggingIndex;
 	int rowDragging;
 	int preserveDragging; //Shift+Drag, can combine with row drag for screen.
+	COLOR *tempPalette; //used and discarded
+	PAL_OP palOp;       //stores current & last palette operation
+	int palOpDialog;    //0 if no palette operation in progress
 
 	COLORREF tmpCust[16];
 
@@ -38,6 +42,10 @@ typedef struct {
 	HWND hWndEnhanceColors;
 	HWND hWndGenerate;
 } NCLRVIEWERDATA;
+
+VOID CopyPalette(COLOR *palette, int nColors);
+
+VOID PastePalette(COLOR *dest, int nMax);
 
 VOID RegisterNclrViewerClass(VOID);
 

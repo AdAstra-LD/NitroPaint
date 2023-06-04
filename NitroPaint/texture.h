@@ -16,6 +16,15 @@
 #define TEXW(p)			(8<<(((p)>>20)&7))
 #define TEXH(p)			(8<<(((p)>>23)&7))
 
+//4x4 compression macros
+#define COMP_INTERPOLATE   0x4000
+#define COMP_FULL          0x0000
+#define COMP_OPAQUE        0x8000
+#define COMP_TRANSPARENT   0x0000
+#define COMP_MODE_MASK     0xC000
+#define COMP_INDEX_MASK    0x3FFF
+#define COMP_INDEX(c)      (((c)&COMP_INDEX_MASK)<<1)
+
 typedef struct {
 	int texImageParam;
 	char *texel;
@@ -36,9 +45,15 @@ typedef struct {
 
 char *stringFromFormat(int fmt);
 
-void convertTexture(DWORD *px, TEXELS *texels, PALETTE *palette, int flip);
+void textureRender(DWORD *px, TEXELS *texels, PALETTE *palette, int flip);
 
 int getTexelSize(int width, int height, int texImageParam);
+
+int getTextureVramSize(TEXELS *texels);
+
+int getIndexVramSize(TEXELS *texels);
+
+int getPaletteVramSize(PALETTE *palette);
 
 void writeNitroTGA(LPWSTR name, TEXELS *texels, PALETTE *palette);
 

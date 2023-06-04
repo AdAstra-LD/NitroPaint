@@ -3,30 +3,21 @@
 #include "texture.h"
 #include "filecommon.h"
 
+#define NSBTX_TYPE_INVALID   0
+#define NSBTX_TYPE_NNS       1
+#define NSBTX_TYPE_BMD       2
+
 typedef struct DICTENTRY_ {
 	int sizeUnit;
 	int offsetName;
 	void *data;
 } DICTENTRY;
 
-typedef struct PTREENODE_{
-	int refBit;
-	int idxLeft;
-	int idxRight;
-	int idxEntry;
-} PTREENODE;
-
 typedef struct DICTIONARY_ {
-	int revision;
 	int nEntries;
-	int sizeDictBlk;
-	int ofsEntry;
-
-	PTREENODE *node;
-	int nNode;
 
 	DICTENTRY entry;
-	char **names;
+	char *namesPtr;
 } DICTIONARY;
 
 typedef struct DICTTEXDATA_ {
@@ -35,24 +26,47 @@ typedef struct DICTTEXDATA_ {
 } DICTTEXDATA;
 
 typedef struct DICTPLTTDATA_ {
-	WORD offset;
-	WORD flag;
+	uint16_t offset;
+	uint16_t flag;
 } DICTPLTTDATA;
 
-typedef struct NSBTX_ {
+
+typedef struct BMD_DATA_ {
+	int scale;
+	int nBones;
+	int nDisplaylists;
+	int nMaterials;
+	int materialsSize;
+	int preTextureSize;
+	int boneOffset;
+	int displaylistOffset;
+	int transformOffset;
+	int field30;
+	int field34;
+	void *bones;
+	void *displaylists;
+	void *materials;
+	void *preTexture;
+} BMD_DATA;
+
+
+typedef struct NSBTX_ { //these should not be converted to other formats
 	OBJECT_HEADER header;
 	int nTextures;
 	int nPalettes;
 	TEXELS *textures;
 	PALETTE *palettes;
-	DICTIONARY textureDictionary;
-	DICTIONARY paletteDictionary;
 
 	void *mdl0;			//for handling NSBMD files as well
 	int mdl0Size;
+	BMD_DATA *bmdData;	//for handling BMD files
 } NSBTX;
 
+void nsbtxInit(NSBTX *nsbtx, int format);
+
 int nsbtxRead(NSBTX *nsbtx, char *buffer, int size);
+
+int nsbtxIsValidBmd(char *buffer, unsigned int size);
 
 int nsbtxReadFile(NSBTX *nsbtx, LPCWSTR path);
 

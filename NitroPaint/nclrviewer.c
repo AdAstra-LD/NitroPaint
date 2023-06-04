@@ -11,12 +11,101 @@
 #include "resource.h"
 #include "palette.h"
 #include "gdip.h"
+#include "ui.h"
 
 extern HICON g_appIcon;
 
-VOID PaintNclrViewer(HWND hWnd, NCLRVIEWERDATA *data, HDC hDC) {
+//IS.Colors4
+typedef struct NC_CLIPBOARD_PALETTE_HEADER_ {
+	DWORD magic; //0xC208B8
+	BOOL is1D;
+	int originRow;
+	int originCol;
+	int unused[2];
+	int nCols;
+	int nRows;
+} NC_CLIPBOARD_PALETTE_HEADER;
 
-	WORD *cols = data->nclr.colors;
+typedef struct NC_CLIPBOARD_PALETTE_FOOTER_ {
+	uint8_t field0[8]; //no idea how these work
+} NC_CLIPBOARD_PALETTE_FOOTER;
+
+//OPX_PALETTE
+typedef struct OP_CLIPBOARD_PALETTE_HEADER_ {
+	short three; //3
+	short nColors;
+} OP_CLIPBOARD_PALETTE_HEADER;
+
+static int g_ncClipboardFormat = 0;
+static int g_opClipboardFormat = 0;
+
+VOID NclrViewerEnsureClipboardFormats(VOID) {
+	if (g_ncClipboardFormat == 0) {
+		g_ncClipboardFormat = RegisterClipboardFormat(L"IS.Colors4");
+		g_opClipboardFormat = RegisterClipboardFormat(L"OPX_PALETTE");
+	}
+}
+
+VOID CopyPalette(COLOR *palette, int nColors) {
+	NclrViewerEnsureClipboardFormats();
+
+	//NC and OPX formats
+	int ncSize = sizeof(NC_CLIPBOARD_PALETTE_HEADER) + nColors * 8 + sizeof(NC_CLIPBOARD_PALETTE_FOOTER);
+	int opSize = sizeof(OP_CLIPBOARD_PALETTE_HEADER) + nColors * 4;
+	HGLOBAL hNc = GlobalAlloc(GMEM_ZEROINIT | GMEM_MOVEABLE, ncSize);
+	HGLOBAL hOp = GlobalAlloc(GMEM_ZEROINIT | GMEM_MOVEABLE, opSize);
+	NC_CLIPBOARD_PALETTE_HEADER *ncData = (NC_CLIPBOARD_PALETTE_HEADER *) GlobalLock(hNc);
+	OP_CLIPBOARD_PALETTE_HEADER *opData = (OP_CLIPBOARD_PALETTE_HEADER *) GlobalLock(hOp);
+	COLOR32 *ncPalette = (COLOR32 *) (ncData + 1);
+	COLOR32 *opPalette = (COLOR32 *) (opData + 1);
+	ncData->magic = 0xC208B8;
+	ncData->is1D = 1;
+	ncData->nCols = nColors;
+	ncData->nRows = 1;
+	opData->three = 3;
+	opData->nColors = nColors;
+	for (int i = 0; i < nColors; i++) {
+		ncPalette[i] = ColorConvertFromDS(palette[i]);
+		ncPalette[i + nColors] = ColorConvertFromDS(palette[i]);
+		opPalette[i] = ColorConvertFromDS(palette[i]);
+	}
+	GlobalUnlock(hNc);
+	GlobalUnlock(hOp);
+	SetClipboardData(g_ncClipboardFormat, hNc);
+	SetClipboardData(g_opClipboardFormat, hOp);
+}
+
+VOID PastePalette(COLOR *dest, int nMax) {
+	NclrViewerEnsureClipboardFormats();
+
+	HGLOBAL hNc = GetClipboardData(g_ncClipboardFormat);
+	HGLOBAL hOp = GetClipboardData(g_opClipboardFormat);
+	COLOR32 *src = NULL;
+	int nCols = 0;
+
+	if (hNc != NULL) {
+		NC_CLIPBOARD_PALETTE_HEADER *ncData = (NC_CLIPBOARD_PALETTE_HEADER *) GlobalLock(hNc);
+		nCols = ncData->nCols * ncData->nRows;
+		src = (COLOR32 *) (ncData + 1);
+	} else if (hOp != NULL) {
+		OP_CLIPBOARD_PALETTE_HEADER *opData = (OP_CLIPBOARD_PALETTE_HEADER *) GlobalLock(hOp);
+		nCols = opData->nColors;
+		src = (COLOR32 *) (opData + 1);
+	} else {
+		return;
+	}
+
+	if (nCols > nMax) nCols = nMax;
+	for (int i = 0; i < nCols; i++) {
+		dest[i] = ColorConvertToDS(src[i]);
+	}
+	if (hNc != NULL) GlobalUnlock(hNc);
+	if (hOp != NULL) GlobalUnlock(hOp);
+}
+
+VOID PaintNclrViewer(HWND hWnd, NCLRVIEWERDATA *data, HDC hDC, int xMin, int yMin, int xMax, int yMax) {
+
+	COLOR *cols = data->nclr.colors;
 	int nRows = data->nclr.nColors / 16;
 
 	HPEN defaultOutline = GetStockObject(BLACK_PEN);
@@ -24,6 +113,8 @@ VOID PaintNclrViewer(HWND hWnd, NCLRVIEWERDATA *data, HDC hDC) {
 	HPEN previewOutline = CreatePen(PS_SOLID, 1, RGB(255, 0, 0));
 	HPEN highlightCellOutline = GetStockObject(WHITE_PEN);
 	HPEN ncerOutline = CreatePen(PS_SOLID, 1, RGB(0, 192, 32));
+	HPEN opSrcOutline = CreatePen(PS_SOLID, 1, RGB(255, 255, 0));
+	HPEN opDstOutline = CreatePen(PS_DOT, 1, RGB(0, 192, 128));
 
 	int previewPalette = -1;
 	HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
@@ -46,8 +137,15 @@ VOID PaintNclrViewer(HWND hWnd, NCLRVIEWERDATA *data, HDC hDC) {
 	int nclrRowsPerPalette = nRowsPerPalette; //(1 << data->nclr.nBits) / 16; //16 in 4, 256 in 8
 	int highlightRowStart = previewPalette * nclrRowsPerPalette;
 	int highlightRowEnd = highlightRowStart + nRowsPerPalette;
-
-	int nColors = 0;
+	
+	int palOpSrcIndex = -1, palOpSrcLength = 0, palOpDstIndex = -1, palOpStrideLength = 0, palOpBlocks = 0;
+	if (data->palOpDialog) {
+		palOpSrcIndex = data->palOp.srcIndex;
+		palOpSrcLength = data->palOp.srcLength;
+		palOpDstIndex = data->palOp.dstOffset * data->palOp.dstStride + data->palOp.srcIndex;
+		palOpStrideLength = data->palOp.dstStride;
+		palOpBlocks = data->palOp.dstCount;
+	}
 
 	int srcIndex, dstIndex;
 	if (!data->rowDragging) {
@@ -65,29 +163,49 @@ VOID PaintNclrViewer(HWND hWnd, NCLRVIEWERDATA *data, HDC hDC) {
 		dstIndex = 16 * (data->dragPoint.y >> 4);
 	}
 
-	for (int y = 0; y < nRows; y++) {
+	SetBkColor(hDC, RGB(0, 0, 0));
+	for (int y = yMin / 16; y < nRows && y < (yMax + 15) / 16; y++) {
 		for (int x = 0; x < 16; x++) {
-			int index = nColors;
+			int index = x + y * 16;
+			int colorIndex = index;
+			if (index > data->nclr.nColors) break;
+
 			if (data->dragging && data->mouseDown) {
 				if (!data->rowDragging) {
-					if (dstIndex < data->nclr.nColors) {
-						if (index == srcIndex) index = dstIndex;
-						else if (index == dstIndex) index = srcIndex;
+					if (dstIndex < data->nclr.nColors && dstIndex >= 0) {
+						if (colorIndex == srcIndex) colorIndex = dstIndex;
+						else if (colorIndex == dstIndex) colorIndex = srcIndex;
 					}
 				} else {
-					if (dstIndex + 15 < data->nclr.nColors) {
-						if (index >= srcIndex && index < srcIndex + 16) index = dstIndex + (index & 0xF);
-						else if (index >= dstIndex && index < dstIndex + 16) index = srcIndex + (index & 0xF);
+					if (dstIndex + 15 < data->nclr.nColors && dstIndex >= 0) {
+						if (colorIndex >= srcIndex && colorIndex < srcIndex + 16) colorIndex = dstIndex + (colorIndex & 0xF);
+						else if (colorIndex >= dstIndex && colorIndex < dstIndex + 16) colorIndex = srcIndex + (colorIndex & 0xF);
 					}
 				}
 			}
-			WORD col = cols[index];
-			DWORD rgb = ColorConvertFromDS(col);
+			COLOR col = cols[colorIndex];
+			COLOR32 rgb = ColorConvertFromDS(col);
 
 			HBRUSH hbr = CreateSolidBrush(rgb);
 			SelectObject(hDC, hbr);
 
-			if (nColors == data->hoverIndex) {
+			//is in palette operation destination area?
+			int isInPalOpDest = 0;
+			if (data->palOpDialog && palOpStrideLength) {
+				int dstRel = x + y * 16 - palOpDstIndex;
+				if (dstRel >= 0 && dstRel < (palOpBlocks - 1) * palOpStrideLength + palOpSrcLength) {
+					dstRel %= palOpStrideLength;
+					if (dstRel < palOpSrcLength) {
+						isInPalOpDest = 1;
+					}
+				}
+			}
+
+			if (y * 16 + x >= palOpSrcIndex && y * 16 + x < palOpSrcIndex + palOpSrcLength) {
+				SelectObject(hDC, opSrcOutline);
+			} else if (isInPalOpDest) {
+				SelectObject(hDC, opDstOutline);
+			} else if (index == data->hoverIndex) {
 				SelectObject(hDC, highlightCellOutline);
 			} else if (previewPalette != -1 && (y >= highlightRowStart && y < highlightRowEnd)) {
 				SelectObject(hDC, previewOutline);
@@ -102,21 +220,30 @@ VOID PaintNclrViewer(HWND hWnd, NCLRVIEWERDATA *data, HDC hDC) {
 			Rectangle(hDC, x * 16, y * 16, x * 16 + 16, y * 16 + 16);
 
 			DeleteObject(hbr);
-			nColors++;
-			if (nColors > data->nclr.nColors) break;
 		}
 	}
 
 	DeleteObject(highlightRowOutline);
 	DeleteObject(previewOutline);
 	DeleteObject(ncerOutline);
+	DeleteObject(opSrcOutline);
+	DeleteObject(opDstOutline);
+}
+
+void NclrViewerPalOpUpdateCallback(PAL_OP *palOp) {
+	HWND hWnd = (HWND) palOp->param;
+	NCLRVIEWERDATA *data = (NCLRVIEWERDATA *) GetWindowLongPtr(hWnd, 0);
+
+	PalopRunOperation(data->tempPalette, data->nclr.colors, data->nclr.nColors, palOp);
+
+	InvalidateRect(hWnd, NULL, FALSE);
 }
 
 int lightness(COLOR col) {
 	int r = GetR(col);
 	int g = GetG(col);
 	int b = GetB(col);
-	return (1063 * r + 3576 * g + 361 * b + 2500) / 5000;
+	return 1063 * r + 3576 * g + 361 * b;
 }
 
 int colorSortLightness(LPCVOID p1, LPCVOID p2) {
@@ -138,10 +265,108 @@ int colorSortHue(LPCVOID p1, LPCVOID p2) {
 	return h1 - h2;
 }
 
-#define NV_INITIALIZE (WM_USER+1)
-#define NV_INITIALIZE_IMMEDIATE (WM_USER+2)
-#define NV_SETTITLE (WM_USER+3)
-#define NV_PICKFILE (WM_USER+4)
+BOOL ValidateColorsNscrProc(HWND hWnd, void *param) {
+	NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWnd, 0);
+	nscrViewerData->verifyColor = (int) param;
+	nscrViewerData->verifyFrames = 10;
+	SetTimer(hWnd, 1, 100, NULL);
+	return TRUE;
+}
+
+BOOL SwapNscrPalettesProc(HWND hWnd, void *param) {
+	int *srcDest = (int *) param;
+	int srcPalette = srcDest[0];
+	int dstPalette = srcDest[1];
+
+	NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWnd, 0);
+	NSCR *nscr = &nscrViewerData->nscr;
+	for (unsigned int i = 0; i < nscr->dataSize / 2; i++) {
+		uint16_t d = nscr->data[i];
+		int pal = (d >> 12) & 0xF;
+		if (pal == srcPalette) pal = dstPalette;
+		else if (pal == dstPalette) pal = srcPalette;
+		d = (d & 0xFFF) | (pal << 12);
+		nscr->data[i] = d;
+	}
+	return TRUE;
+}
+
+void paletteSwapColors(COLOR *palette, int i1, int i2) {
+	COLOR c1 = palette[i1];
+	palette[i1] = palette[i2];
+	palette[i2] = c1;
+}
+
+int paletteNeuroSortPermute(COLOR *palette, int nColors, unsigned long long bestDiff) {
+	int totalDiff = 0;
+	for (int i = 1; i < nColors; i++) {
+		COLOR32 last = ColorConvertFromDS(palette[i - 1]);
+		int nextIndex = i;
+
+		int minDiff = 0x7FFFFFFF;
+		for (int j = i; j < nColors; j++) {
+			COLOR32 test = ColorConvertFromDS(palette[j]);
+			
+			int dr, dg, db, dy, du, dv;
+			dr = (last & 0xFF) - (test & 0xFF);
+			dg = ((last >> 8) & 0xFF) - ((test >> 8) & 0xFF);
+			db = ((last >> 16) & 0xFF) - ((test >> 16) & 0xFF);
+			convertRGBToYUV(dr, dg, db, &dy, &du, &dv);
+			int diff = 4 * dy * dy + du * du + dv * dv;
+			if (diff < minDiff) {
+				nextIndex = j;
+				minDiff = diff;
+			}
+		}
+
+		paletteSwapColors(palette, i, nextIndex);
+		totalDiff += minDiff;
+		if (totalDiff >= bestDiff) return totalDiff;
+	}
+	return totalDiff;
+}
+
+typedef struct PALETTE_ARRANGE_DATA_ {
+	HWND hWndViewer;
+	COLOR *palette;
+	int nColors;
+} PALETTE_ARRANGE_DATA;
+
+DWORD CALLBACK paletteNeuroSort(LPVOID param) {
+	PALETTE_ARRANGE_DATA *data = (PALETTE_ARRANGE_DATA *) param;
+	HWND hWnd = data->hWndViewer;
+	COLOR *palette = data->palette;
+	int nColors = data->nColors;
+
+	int best = 0x7FFFFFFF;
+	COLOR *tempBuf = (COLOR *) calloc(nColors, sizeof(COLOR));
+
+	//iterate permutations
+	for (int i = 0; i < nColors; i++) {
+		memcpy(tempBuf, palette, nColors * sizeof(COLOR));
+		paletteSwapColors(tempBuf, 0, i);
+
+		int permutationError = paletteNeuroSortPermute(tempBuf, nColors, best);
+		if (permutationError < best) {
+			memcpy(palette, tempBuf, nColors * sizeof(COLOR));
+			best = permutationError;
+			PostMessage(hWnd, NV_XTINVALIDATE, 0, 0);
+		}
+	}
+
+	free(tempBuf);
+	free(data);
+	return 0;
+}
+
+void paletteNeuroSortThreaded(HWND hWnd, COLOR *palette, int nColors) {
+	PALETTE_ARRANGE_DATA *data = (PALETTE_ARRANGE_DATA *) calloc(1, sizeof(PALETTE_ARRANGE_DATA));
+	DWORD tid;
+	data->hWndViewer = hWnd;
+	data->palette = palette;
+	data->nColors = nColors;
+	CreateThread(NULL, 0, paletteNeuroSort, (LPVOID) data, 0, &tid);
+}
 
 LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	NCLRVIEWERDATA *data = (NCLRVIEWERDATA *) GetWindowLongPtr(hWnd, 0);
@@ -152,11 +377,22 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 	switch (msg) {
 		case WM_CREATE:
 		{
-			data->contentWidth = 256;
+			data->contentWidth = 0; //prevent horizontal scrollbar
 			data->contentHeight = 256;
 			data->hoverX = -1;
 			data->hoverY = -1;
 			data->hoverIndex = -1;
+
+			PAL_OP *palOp = &data->palOp;
+			HWND hWndMain = getMainWindow(hWnd);
+			palOp->hWndParent = hWndMain;
+			palOp->param = (void *) hWnd;
+			palOp->dstOffset = 1;
+			palOp->ignoreFirst = 1;
+			palOp->dstCount = 1;
+			palOp->dstStride = 16;
+			palOp->srcLength = 16;
+			palOp->updateCallback = NclrViewerPalOpUpdateCallback;
 
 			RECT rcClient;
 			GetClientRect(hWnd, &rcClient);
@@ -201,15 +437,28 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 				memcpy(&data->nclr, nclr, sizeof(NCLR));
 			}
 
-			HWND hWndMdi = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
-			HWND hWndMain = (HWND) GetWindowLong(hWndMdi, GWL_HWNDPARENT);
-			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-			if (nitroPaintStruct->hWndNcgrViewer) InvalidateRect(nitroPaintStruct->hWndNcgrViewer, NULL, FALSE);
-			if (nitroPaintStruct->hWndNscrViewer) InvalidateRect(nitroPaintStruct->hWndNscrViewer, NULL, FALSE);
+			HWND hWndMain = getMainWindow(hWnd);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_CHAR);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
 
 			if (data->nclr.header.format == NCLR_TYPE_HUDSON) {
 				SendMessage(hWnd, WM_SETICON, ICON_BIG, (LPARAM) LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON2)));
 			}
+
+			//set appropriate height
+			data->contentHeight = ((data->nclr.nColors + 15) / 16) * 16;
+			if (data->contentHeight > 256) {
+				SetWindowSize(hWnd, 256 + 4 + GetSystemMetrics(SM_CXVSCROLL), 257);
+			}
+
+			//update scroll info
+			SCROLLINFO info;
+			info.cbSize = sizeof(info);
+			info.nMin = 0;
+			info.nMax = data->contentHeight;
+			info.fMask = SIF_RANGE;
+			SetScrollInfo(hWnd, SB_VERT, &info, TRUE);
+			InvalidateRect(hWnd, NULL, FALSE);
 			return 1;
 		}
 		case WM_MOUSEMOVE:
@@ -277,12 +526,11 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			data->hoverY = hoverY;
 			data->hoverIndex = hoverIndex;
 
-			InvalidateRect(hWnd, NULL, FALSE);
 			HWND hWndMain = getMainWindow(hWnd);
-			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-			if (nitroPaintStruct->hWndNcgrViewer) InvalidateRect(nitroPaintStruct->hWndNcgrViewer, NULL, FALSE);
-			if (nitroPaintStruct->hWndNscrViewer) InvalidateRect(nitroPaintStruct->hWndNscrViewer, NULL, FALSE);
-			if (nitroPaintStruct->hWndNcerViewer) InvalidateRect(nitroPaintStruct->hWndNcerViewer, NULL, FALSE);
+			InvalidateRect(hWnd, NULL, FALSE);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_CHAR);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_CELL);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
 			break;
 		}
 		case WM_LBUTTONDOWN:
@@ -350,7 +598,7 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					int x = mousePos.x / 16;
 					int y = mousePos.y / 16;
 					int index = y * 16 + x;
-					if (index < data->nclr.nColors) {
+					if (index < data->nclr.nColors && index >= 0) {
 						HWND hWndMain = getMainWindow(hWnd);
 						CHOOSECOLOR cc = { 0 };
 						cc.lStructSize = sizeof(cc);
@@ -366,10 +614,9 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 							data->nclr.colors[index] = ColorConvertToDS(result);
 							InvalidateRect(hWnd, NULL, FALSE);
 							
-							NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-							if (nitroPaintStruct->hWndNcgrViewer) InvalidateRect(nitroPaintStruct->hWndNcgrViewer, NULL, FALSE);
-							if (nitroPaintStruct->hWndNscrViewer) InvalidateRect(nitroPaintStruct->hWndNscrViewer, NULL, FALSE);
-							if (nitroPaintStruct->hWndNcerViewer) InvalidateRect(nitroPaintStruct->hWndNcerViewer, NULL, FALSE);
+							InvalidateAllEditors(hWndMain, FILE_TYPE_CHAR);
+							InvalidateAllEditors(hWndMain, FILE_TYPE_CELL);
+							InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
 						}
 					}
 				}
@@ -386,7 +633,6 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 				HWND hWndMain = getMainWindow(hWnd);
 				NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 				HWND hWndNcgrViewer = nitroPaintStruct->hWndNcgrViewer;
-				HWND hWndNscrViewer = nitroPaintStruct->hWndNscrViewer;
 				if (!data->rowDragging) {
 					//test for preserve dragging to adjust destination 
 					if (data->preserveDragging && hWndNcgrViewer != NULL) {
@@ -399,7 +645,7 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						}
 					}
 
-					if (dstIndex < data->nclr.nColors) {
+					if (dstIndex < data->nclr.nColors && dstIndex >= 0) {
 						WORD *pal = data->nclr.colors;
 						WORD src = pal[srcIndex];
 						pal[srcIndex] = pal[dstIndex];
@@ -415,7 +661,8 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 								//if no screen, just swap the indices if the palette numbers line up.
 								int nclrPalette = srcIndex >> ncgr->nBits;
 								int mask = ncgr->nBits == 8 ? 0xFF : 0xF;
-								if (hWndNscrViewer == NULL) {
+								int nNscrEditors;
+								if ((nNscrEditors = GetAllEditors(hWndMain, FILE_TYPE_SCREEN, NULL, 0)) == 0) {
 									int ncgrPalette = ncgrViewerData->selectedPalette;
 									if (ncgrPalette == nclrPalette) {
 
@@ -428,60 +675,57 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 										}
 									}
 								} else {
-									//with screen, so do the above but only for tiles referenced by it.
-									NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
-									NSCR *nscr = &nscrViewerData->nscr;
-									
 									//this is messy. To avoid "fxing" a tile twice, keep track of which ones have been "fixed".
 									BYTE *fixBuffer = (BYTE *) calloc(ncgr->nTiles, 1);
-									for (unsigned int i = 0; i < nscr->dataSize / 2; i++) {
-										WORD d = nscr->data[i];
-										int chr = d & 0x3FF;
-										int pal = (d >> 12) & 0xF;
 
-										if (pal == nclrPalette) {
-											int cIndex = chr - nscrViewerData->tileBase;
-											if (cIndex >= 0 && cIndex < ncgr->nTiles && !fixBuffer[cIndex]) {
-												BYTE *tile = ncgr->tiles[cIndex];
-												for (int j = 0; j < 64; j++) {
-													if (tile[j] == (srcIndex & mask)) tile[j] = dstIndex & mask;
-													else if (tile[j] == (dstIndex & mask)) tile[j] = srcIndex & mask;
+									//check each open screen file
+									HWND *nscrViewers = (HWND *) calloc(nNscrEditors, sizeof(HWND));
+									GetAllEditors(hWndMain, FILE_TYPE_SCREEN, nscrViewers, nNscrEditors);
+									for (int nscrId = 0; nscrId < nNscrEditors; nscrId++) {
+										//with screen, so do the above but only for tiles referenced by it.
+										HWND hWndNscrViewer = nscrViewers[nscrId];
+										NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
+										NSCR *nscr = &nscrViewerData->nscr;
+
+										for (unsigned int i = 0; i < nscr->dataSize / 2; i++) {
+											WORD d = nscr->data[i];
+											int chr = d & 0x3FF;
+											int pal = (d >> 12) & 0xF;
+
+											if (pal == nclrPalette) {
+												int cIndex = chr - nscrViewerData->tileBase;
+												if (cIndex >= 0 && cIndex < ncgr->nTiles && !fixBuffer[cIndex]) {
+													BYTE *tile = ncgr->tiles[cIndex];
+													for (int j = 0; j < 64; j++) {
+														if (tile[j] == (srcIndex & mask)) tile[j] = dstIndex & mask;
+														else if (tile[j] == (dstIndex & mask)) tile[j] = srcIndex & mask;
+													}
+													fixBuffer[cIndex] = 1;
 												}
-												fixBuffer[cIndex] = 1;
 											}
 										}
 									}
 									free(fixBuffer);
+									free(nscrViewers);
 								}
 							}
 						}
 					}
 				} else {
-					if (dstIndex + 15 < data->nclr.nColors) {
-						WORD tmp[16];
-						WORD *pal = data->nclr.colors;
+					if (dstIndex + 15 < data->nclr.nColors && dstIndex >= 0) {
+						COLOR tmp[16];
+						COLOR *pal = data->nclr.colors;
 						memcpy(tmp, pal + srcIndex, 32);
 						memcpy(pal + srcIndex, pal + dstIndex, 32);
 						memcpy(pal + dstIndex, tmp, 32);
 
 						//if screen is present and we're in preserve mode, then switch relevant tile palettes as well.
 						if (data->preserveDragging) {
-							if (hWndNscrViewer != NULL) {
-								NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
-								NSCR *nscr = &nscrViewerData->nscr;
-
-								//doing this only really makes sense for 4-bit graphics, but who are we to disagree with the user
-								int srcPalette = srcIndex >> 4;
-								int dstPalette = dstIndex >> 4;
-								for (unsigned int i = 0; i < nscr->dataSize / 2; i++) {
-									WORD d = nscr->data[i];
-									int pal = (d >> 12) & 0xF;
-									if (pal == srcPalette) pal = dstPalette;
-									else if (pal == dstPalette) pal = srcPalette;
-									d = (d & 0xFFF) | (pal << 12);
-									nscr->data[i] = d;
-								}
-							}
+							//doing this only really makes sense for 4-bit graphics, but who are we to disagree with the user
+							int srcPalette = srcIndex >> 4;
+							int dstPalette = dstIndex >> 4;
+							int srcDest[] = { srcPalette, dstPalette };
+							EnumAllEditors(hWndMain, FILE_TYPE_SCREEN, SwapNscrPalettesProc, srcDest);
 						}
 					}
 				}
@@ -525,6 +769,9 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			}
 			break;
 		}
+		case NV_XTINVALIDATE:
+			InvalidateRect(hWnd, NULL, FALSE);
+			break;
 		case WM_PAINT:
 		{
 			RECT rcClient;
@@ -552,7 +799,7 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			SelectObject(hDC, defaultPen);
 			SelectObject(hDC, defaultBrush);
 
-			PaintNclrViewer(hWnd, data, hDC);
+			PaintNclrViewer(hWnd, data, hDC, horiz.nPos, vert.nPos, horiz.nPos + rcClient.right, vert.nPos + rcClient.bottom);
 
 			BitBlt(hWindowDC, 0, 0, rcClient.right - rcClient.left, rcClient.bottom - rcClient.top, hDC, horiz.nPos, vert.nPos, SRCCOPY);
 			EndPaint(hWnd, &ps);
@@ -580,6 +827,9 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 				case NCLR_TYPE_COMBO:
 					filter = L"Combination Files (*.dat, *.bnr, *.bin)\0*.dat;*.bnr;*.bin\0";
 					break;
+				case NCLR_TYPE_NC:
+					filter = L"NCL Files (*.ncl)\0*.ncl\0All Files\0*.*\0";
+					break;
 			}
 			LPWSTR path = saveFileDialog(getMainWindow(hWnd), L"Save As...", filter, L"nclr");
 			if (path != NULL) {
@@ -598,32 +848,13 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						int offset = data->contextHoverY * 16;
 
 						OpenClipboard(hWnd);
-						HANDLE hString = GetClipboardData(CF_TEXT);
+						PastePalette(data->nclr.colors + offset, data->nclr.nColors - offset);
 						CloseClipboard();
-						LPSTR palString = GlobalLock(hString);
-						WORD length = (palString[0] & 0xF) | ((palString[1] & 0xF) << 4) | ((palString[2] & 0xF) << 8) | ((palString[3] & 0xF) << 12);
 
-						int maxOffset = data->nclr.nColors;
-
-						int strOffset = 4;
-						for (int i = 0; i < length; i++) {
-							int location = offset + i;
-							if (location >= maxOffset) break;
-							int row = location >> 4;
-							int col = 1 + (location & 0xF);
-							DWORD color = 0;
-							for (int j = 0; j < 8; j++) {
-								color = (color << 4) | (palString[strOffset] & 0xF);
-								strOffset++;
-							}
-							data->nclr.colors[location] = ColorConvertToDS(color);
-						}
-						GlobalUnlock(hString);
-						InvalidateRect(hWnd, NULL, FALSE);
 						HWND hWndMain = getMainWindow(hWnd);
-						NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
-						if (nitroPaintStruct->hWndNcgrViewer) InvalidateRect(nitroPaintStruct->hWndNcgrViewer, NULL, FALSE);
-						if (nitroPaintStruct->hWndNscrViewer) InvalidateRect(nitroPaintStruct->hWndNscrViewer, NULL, FALSE);
+						InvalidateAllEditors(hWndMain, FILE_TYPE_CHAR);
+						InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
+						InvalidateRect(hWnd, NULL, FALSE);
 						break;
 					}
 					case ID_MENU_COPY:
@@ -635,31 +866,10 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 							length = maxOffset - offset;
 							if (length < 0) length = 0;
 						}
-						HANDLE hString = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 4 + 8 * length + 1);
-						LPSTR palString = (LPSTR) GlobalLock(hString);
-						palString[0] = 0x20 + (length & 0xF);
-						palString[1] = 0x20 + ((length >> 4) & 0xF);
-						palString[2] = 0x20 + ((length >> 8) & 0xF);
-						palString[3] = 0x20 + ((length >> 12) & 0xF);
 
-						int strOffset = 4;
-						for (int i = 0; i < length; i++) {
-							int offs = i + offset;
-							int row = offs >> 4;
-							int col = (offs & 0xF) + 1;
-							DWORD d = 0x00FFFFFF & (ColorConvertFromDS(data->nclr.colors[offs]));
-
-							for (int j = 0; j < 8; j++) {
-								palString[strOffset] = 0x30 + ((d >> 28) & 0xF);
-								d <<= 4;
-								strOffset++;
-							}
-						}
-
-						GlobalUnlock(hString);
 						OpenClipboard(hWnd);
 						EmptyClipboard();
-						SetClipboardData(CF_TEXT, hString);
+						CopyPalette(data->nclr.colors + offset, length);
 						CloseClipboard();
 						break;
 					}
@@ -693,15 +903,24 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 					}
 					case ID_ARRANGEPALETTE_BYLIGHTNESS:
 					case ID_ARRANGEPALETTE_BYHUE:
+					case ID_ARRANGEPALETTE_NEURO:
 					{
 						int index = data->contextHoverX + data->contextHoverY * 16;
 						int palette = index >> data->nclr.nBits;
 
-						COLOR *pal = data->nclr.colors + (palette << data->nclr.nBits);
+						int nColsPerPalette = 1 << data->nclr.nBits;
+						COLOR *pal = data->nclr.colors + palette * nColsPerPalette;
+						int nColors = nColsPerPalette;
+						if ((palette + 1) * nColsPerPalette > data->nclr.nColors) 
+							nColors = data->nclr.nColors - palette * nColsPerPalette;
 
 						int type = LOWORD(wParam);
-						qsort(pal + 1, (1 << data->nclr.nBits) - 1, 2, 
-							  type == ID_ARRANGEPALETTE_BYLIGHTNESS ? colorSortLightness : colorSortHue);
+						if (type == ID_ARRANGEPALETTE_BYLIGHTNESS || type == ID_ARRANGEPALETTE_BYHUE) {
+							qsort(pal + 1, nColors - 1, sizeof(COLOR),
+								type == ID_ARRANGEPALETTE_BYLIGHTNESS ? colorSortLightness : colorSortHue);
+						} else {
+							paletteNeuroSortThreaded(hWnd, pal + 1, nColors - 1);
+						}
 						InvalidateRect(hWnd, NULL, FALSE);
 						break;
 					}
@@ -725,7 +944,7 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						COLOR32 *bits = (COLOR32 *) calloc(width * height, sizeof(COLOR32));
 						for (int i = 0; i < data->nclr.nColors; i++) {
 							COLOR32 as32 = ColorConvertFromDS(data->nclr.colors[i]) | 0xFF000000;
-							bits[i] = REVERSE(as32);
+							bits[i] = as32;
 						}
 						writeImage(bits, width, height, path);
 						free(path);
@@ -755,22 +974,16 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						int index = data->contextHoverX + data->contextHoverY * 16;
 						int palette = index >> data->nclr.nBits;
 						
-						HWND hWndMain = (HWND) GetWindowLong((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), GWL_HWNDPARENT);
+						HWND hWndMain = getMainWindow(hWnd);
 						NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 						HWND hWndNcgrViewer = nitroPaintStruct->hWndNcgrViewer;
-						HWND hWndNscrViewer = nitroPaintStruct->hWndNscrViewer;
 						if (hWndNcgrViewer) {
 							NCGRVIEWERDATA *ncgrViewerData = (NCGRVIEWERDATA *) GetWindowLongPtr(hWndNcgrViewer, 0);
 							ncgrViewerData->verifyColor = index;
 							ncgrViewerData->verifyFrames = 10;
 							SetTimer(hWndNcgrViewer, 1, 100, NULL);
 						}
-						if (hWndNscrViewer) {
-							NSCRVIEWERDATA *nscrViewerData = (NSCRVIEWERDATA *) GetWindowLongPtr(hWndNscrViewer, 0);
-							nscrViewerData->verifyColor = index;
-							nscrViewerData->verifyFrames = 10;
-							SetTimer(hWndNscrViewer, 1, 100, NULL);
-						}
+						EnumAllEditors(hWndMain, FILE_TYPE_SCREEN, ValidateColorsNscrProc, (void *) index);
 						break;
 					}
 					case ID_MENU_CREATE:
@@ -786,6 +999,31 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 						SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) | WS_DISABLED);
 						break;
 					}
+					case ID_MENU_ANIMATEPALETTE:
+					{
+						data->tempPalette = (COLOR *) calloc(data->nclr.nColors, sizeof(COLOR));
+						memcpy(data->tempPalette, data->nclr.colors, data->nclr.nColors * sizeof(COLOR));
+
+						PAL_OP *palOp = &data->palOp;
+						palOp->srcIndex = data->contextHoverY * 16;
+						data->palOpDialog = 1;
+						int n = SelectPaletteOperation(palOp);
+						data->palOpDialog = 0;
+
+						memcpy(data->nclr.colors, data->tempPalette, data->nclr.nColors * sizeof(COLOR));
+						free(data->tempPalette);
+						data->tempPalette = NULL;
+
+						//apply modifier
+						if (n) {
+							COLOR *cpy = (COLOR *) calloc(data->nclr.nColors, sizeof(COLOR));
+							PalopRunOperation(data->nclr.colors, cpy, data->nclr.nColors, palOp);
+							memcpy(data->nclr.colors, cpy, data->nclr.nColors * sizeof(COLOR));
+							free(cpy);
+						}
+						InvalidateRect(hWnd, NULL, FALSE);
+						break;
+					}
 				}
 			}
 			break;
@@ -795,15 +1033,17 @@ LRESULT WINAPI NclrViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			fileFree((OBJECT_HEADER *) &data->nclr);
 			if (data->nclr.idxTable != NULL) free(data->nclr.idxTable);
 			free(data);
-			HWND hWndMdi = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
-			HWND hWndMain = (HWND) GetWindowLong(hWndMdi, GWL_HWNDPARENT);
+
+			HWND hWndMain = getMainWindow(hWnd);
 			NITROPAINTSTRUCT *nitroPaintStruct = (NITROPAINTSTRUCT *) GetWindowLongPtr(hWndMain, 0);
 			nitroPaintStruct->hWndNclrViewer = NULL;
-			if (nitroPaintStruct->hWndNcgrViewer) InvalidateRect(nitroPaintStruct->hWndNcgrViewer, NULL, FALSE);
-			if (nitroPaintStruct->hWndNscrViewer) InvalidateRect(nitroPaintStruct->hWndNscrViewer, NULL, FALSE);
-			if (nitroPaintStruct->hWndNcerViewer) InvalidateRect(nitroPaintStruct->hWndNcerViewer, NULL, FALSE); 
+			InvalidateAllEditors(hWndMain, FILE_TYPE_CHAR);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_CELL);
+			InvalidateAllEditors(hWndMain, FILE_TYPE_SCREEN);
 			break;
 		}
+		case NV_GETTYPE:
+			return FILE_TYPE_PALETTE;
 	}
 	return DefChildProc(hWnd, msg, wParam, lParam);
 }
@@ -821,34 +1061,28 @@ LRESULT CALLBACK PaletteGeneratorDialogProc(HWND hWnd, UINT msg, WPARAM wParam, 
 			data = (NCLRVIEWERDATA *) lParam;
 			SetWindowLongPtr(hWnd, 0, (LONG_PTR) data);
 
-			CreateWindow(L"STATIC", L"Bitmap:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 10, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndFileInput = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL, 120, 10, 200, 22, hWnd, NULL, NULL, NULL);
-			data->hWndBrowse = CreateWindow(L"BUTTON", L"...", WS_VISIBLE | WS_CHILD, 320, 10, 25, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Colors:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 37, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndColors = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"16", WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL | ES_NUMBER, 120, 37, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Reserve first:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 64, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndReserve = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 64, 22, 22, hWnd, NULL, NULL, NULL);
-			SendMessage(data->hWndReserve, BM_SETCHECK, 1, 0);
+			CreateStatic(hWnd, L"Bitmap:", 10, 10, 100, 22);
+			data->hWndFileInput = CreateEdit(hWnd, L"", 120, 10, 200, 22, FALSE);
+			data->hWndBrowse = CreateButton(hWnd, L"...", 320, 10, 25, 22, FALSE);
+			CreateStatic(hWnd, L"Colors:", 10, 37, 100, 22);
+			data->hWndColors = CreateEdit(hWnd, L"16", 120, 37, 100, 22, TRUE);
+			CreateStatic(hWnd, L"Reserve First:", 10, 64, 100, 22);
+			data->hWndReserve = CreateCheckbox(hWnd, L"", 120, 64, 22, 22, TRUE);
 
 			//palette options
-			CreateWindow(L"STATIC", L"Balance:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 96, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Lightness", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE | SS_RIGHT, 120, 96, 50, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Color", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 170 + 150, 96, 50, 22, hWnd, NULL, NULL, NULL);
-			data->hWndBalance = CreateWindow(TRACKBAR_CLASS, L"", WS_VISIBLE | WS_CHILD, 170, 96, 150, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Color balance:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 123, 100, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Green", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE | SS_RIGHT, 120, 123, 50, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Red", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 170 + 150, 123, 50, 22, hWnd, NULL, NULL, NULL);
-			data->hWndColorBalance = CreateWindow(TRACKBAR_CLASS, L"", WS_VISIBLE | WS_CHILD, 170, 123, 150, 22, hWnd, NULL, NULL, NULL);
-			CreateWindow(L"STATIC", L"Enhance colors:", WS_VISIBLE | WS_CHILD | SS_CENTERIMAGE, 10, 150, 100, 22, hWnd, NULL, NULL, NULL);
-			data->hWndEnhanceColors = CreateWindow(L"BUTTON", L"", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 120, 150, 22, 22, hWnd, NULL, NULL, NULL);
+			CreateStatic(hWnd, L"Balance:", 10, 96, 100, 22);
+			CreateStaticAligned(hWnd, L"Lightness", 120, 96, 50, 22, SCA_RIGHT);
+			CreateStaticAligned(hWnd, L"Color", 170 + 150, 95, 50, 22, SCA_LEFT);
+			data->hWndBalance = CreateTrackbar(hWnd, 170, 96, 150, 22, BALANCE_MIN, BALANCE_MAX, BALANCE_DEFAULT);
+			CreateStatic(hWnd, L"Color Balance:", 10, 123, 100, 22);
+			CreateStaticAligned(hWnd, L"Green", 120, 123, 50, 22, SCA_RIGHT);
+			CreateStaticAligned(hWnd, L"Red", 170 + 150, 123, 50, 22, SCA_LEFT);
+			data->hWndColorBalance = CreateTrackbar(hWnd, 170, 123, 150, 22, BALANCE_MIN, BALANCE_MAX, BALANCE_DEFAULT);
+			CreateStatic(hWnd, L"Enhance Colors:", 10, 150, 100, 22);
+			data->hWndEnhanceColors = CreateCheckbox(hWnd, L"", 120, 150, 22, 22, FALSE);
 
-			data->hWndGenerate = CreateWindow(L"BUTTON", L"Generate", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 120, 182, 100, 22, hWnd, NULL, NULL, NULL);
+			data->hWndGenerate = CreateButton(hWnd, L"Generate", 120, 182, 100, 22, TRUE);
 			EnumChildWindows(hWnd, SetFontProc, (LPARAM) GetStockObject(DEFAULT_GUI_FONT));
-
-			SendMessage(data->hWndBalance, TBM_SETRANGE, TRUE, 0 | (40 << 16));
-			SendMessage(data->hWndColorBalance, TBM_SETRANGE, TRUE, 0 | (40 << 16));
-			SendMessage(data->hWndBalance, TBM_SETPOS, TRUE, 20);
-			SendMessage(data->hWndColorBalance, TBM_SETPOS, TRUE, 20);
 			break;
 		}
 		case WM_COMMAND:
@@ -856,7 +1090,7 @@ LRESULT CALLBACK PaletteGeneratorDialogProc(HWND hWnd, UINT msg, WPARAM wParam, 
 			HWND hWndControl = (HWND) lParam;
 			WORD notif = HIWORD(wParam);
 			if (notif == BN_CLICKED && hWndControl == data->hWndBrowse) {
-				LPWSTR path = openFileDialog(hWnd, L"Select Bitmap", L"Supported Image Files\0*.png;*.bmp;*.gif;*.jpg;*.jpeg\0All Files\0*.*\0", L"");
+				LPWSTR path = openFilesDialog(hWnd, L"Select Bitmap", L"Supported Image Files\0*.png;*.bmp;*.gif;*.jpg;*.jpeg\0All Files\0*.*\0", L"");
 				if (path != NULL) {
 					SendMessage(data->hWndFileInput, WM_SETTEXT, wcslen(path), (LPARAM) path);
 					free(path);
@@ -864,31 +1098,52 @@ LRESULT CALLBACK PaletteGeneratorDialogProc(HWND hWnd, UINT msg, WPARAM wParam, 
 			} else if (notif == BN_CLICKED && hWndControl == data->hWndGenerate) {
 				int width, height;
 				WCHAR bf[MAX_PATH + 1];
-				SendMessage(data->hWndFileInput, WM_GETTEXT, MAX_PATH, (LPARAM) bf);
-				DWORD *bits = gdipReadImage(bf, &width, &height);
+				LPWSTR paths = (LPWSTR) calloc((MAX_PATH + 1) * 32 + 1, sizeof(WCHAR));
+				SendMessage(data->hWndFileInput, WM_GETTEXT, (MAX_PATH + 1) * 32 + 1, (LPARAM) paths);
+				int nPaths = getPathCount(paths);
 
-				SendMessage(data->hWndColors, WM_GETTEXT, MAX_PATH, (LPARAM) bf);
-				int nColors = _wtol(bf);
-				int balance = SendMessage(data->hWndBalance, TBM_GETPOS, 0, 0);
-				int colorBalance = SendMessage(data->hWndColorBalance, TBM_GETPOS, 0, 0);
+				int nColors = GetEditNumber(data->hWndColors);
+				int balance = GetTrackbarPosition(data->hWndBalance);
+				int colorBalance = GetTrackbarPosition(data->hWndColorBalance);
 				if (nColors > 256) nColors = 256;
 
-				BOOL enhanceColors = SendMessage(data->hWndEnhanceColors, BM_GETCHECK, 0, 0) == BST_CHECKED;
-				BOOL reserveFirst = SendMessage(data->hWndReserve, BM_GETCHECK, 0, 0) == BST_CHECKED;
+				BOOL enhanceColors = GetCheckboxChecked(data->hWndEnhanceColors);
+				BOOL reserveFirst = GetCheckboxChecked(data->hWndReserve);
 
 				//create palette copy
 				int nTotalColors = data->nclr.nColors;
 				int index = data->contextHoverX + data->contextHoverY * 16;
-				DWORD *paletteCopy = (DWORD *) calloc(nColors, 4);
-				createPaletteSlowEx(bits, width, height, paletteCopy + reserveFirst, nColors - reserveFirst, balance, colorBalance, enhanceColors, FALSE);
+				COLOR32 *paletteCopy = (COLOR32 *) calloc(nColors, sizeof(COLOR32));
+
+				//compute histogram
+				REDUCTION *reduction = (REDUCTION *) calloc(1, sizeof(REDUCTION));
+				initReduction(reduction, balance, colorBalance, 15, enhanceColors, nColors - reserveFirst);
+				for (int i = 0; i < nPaths; i++) {
+					getPathFromPaths(paths, i, bf);
+					COLOR32 *bits = gdipReadImage(bf, &width, &height);
+					computeHistogram(reduction, bits, width, height);
+					free(bits);
+				}
+				flattenHistogram(reduction);
+
+				//create and write palette
+				optimizePalette(reduction);
+				for (int i = 0; i < nColors - reserveFirst; i++) {
+					uint8_t *c8 = &reduction->paletteRgb[i][0];
+					COLOR32 c = c8[0] | (c8[1] << 8) | (c8[2] << 16);
+					(paletteCopy + reserveFirst)[i] = c;
+				}
+				qsort(paletteCopy + reserveFirst, nColors - reserveFirst, sizeof(COLOR32), lightnessCompare);
+				destroyReduction(reduction);
+				free(reduction);
 
 				//write back
 				for (int i = 0; i < nColors; i++) {
 					if (i + index >= nTotalColors) break;
 					data->nclr.colors[i + index] = ColorConvertToDS(paletteCopy[i]);
 				}
+				free(paths);
 				free(paletteCopy);
-				free(bits);
 
 				SendMessage(hWnd, WM_CLOSE, 0, 0);
 				InvalidateRect((HWND) GetWindowLong(hWnd, GWL_HWNDPARENT), NULL, FALSE);
@@ -898,7 +1153,7 @@ LRESULT CALLBACK PaletteGeneratorDialogProc(HWND hWnd, UINT msg, WPARAM wParam, 
 		case WM_CLOSE:
 		{
 			HWND hWndMain = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
-			SetWindowLong(hWndMain, GWL_STYLE, GetWindowLong(hWndMain, GWL_STYLE) & ~WS_DISABLED);
+			setStyle(hWndMain, FALSE, WS_DISABLED);
 			SetActiveWindow(hWndMain);
 			break;
 		}

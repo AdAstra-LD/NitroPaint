@@ -6,19 +6,18 @@
 #include "nsbtxviewer.h"
 #include "nitropaint.h"
 #include "resource.h"
+#include "ui.h"
 
 extern HICON g_appIcon;
-
-#define NV_INITIALIZE (WM_USER+1)
-#define NV_SETTITLE (WM_USER+2)
 
 extern int max16Len(char *str);
 
 HBITMAP renderTexture(TEXELS *texture, PALETTE *palette, int zoom) {
+	if (texture == NULL) return NULL;
 	int width = TEXW(texture->texImageParam);
 	int height = TEXH(texture->texImageParam);
-	DWORD *px = (DWORD *) calloc(width * zoom * height * zoom, 4);
-	convertTexture(px, texture, palette, 0);
+	COLOR32 *px = (COLOR32 *) calloc(width * zoom * height * zoom, 4);
+	textureRender(px, texture, palette, 0);
 
 	//perform alpha blending
 	int scaleWidth = width * zoom, scaleHeight = height * zoom;
@@ -27,7 +26,7 @@ HBITMAP renderTexture(TEXELS *texture, PALETTE *palette, int zoom) {
 		for (int xDest = scaleWidth - 1; xDest >= 0; xDest--) {
 			int x = xDest / zoom;
 
-			DWORD pixel = px[x + y * width];
+			COLOR32 pixel = px[x + y * width];
 			int a = pixel >> 24;
 			if (a != 255) {
 				int s = ((xDest >> 3) ^ (yDest >> 3)) & 1;
@@ -230,6 +229,18 @@ int guessTexPlttByName(char *textureName, char **paletteNames, int nPalettes, TE
 	return 0;
 }
 
+LRESULT CALLBACK ListboxDeleteSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT subclass, DWORD_PTR ref) {
+	if (msg == WM_KEYDOWN && wParam == VK_DELETE) {
+		HWND hWndParent = (HWND) GetWindowLong(hWnd, GWL_HWNDPARENT);
+		int sel = SendMessage(hWnd, LB_GETCURSEL, 0, 0);
+		SendMessage(hWnd, LB_DELETESTRING, sel, 0);
+		SendMessage(hWndParent, NV_CHILDNOTIF, sel, (LPARAM) hWnd);
+	}
+	return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
+void CreateVramUseWindow(HWND hWndParent, NSBTX *nsbtx);
+
 LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	NSBTXVIEWERDATA *data = (NSBTXVIEWERDATA *) GetWindowLongPtr(hWnd, 0);
 	if (data == NULL) {
@@ -241,9 +252,13 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 		{
 			data->hWndTextureSelect = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTBOX, L"", WS_VISIBLE | WS_CHILD | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | LBS_NOTIFY, 0, 0, 150, 100, hWnd, NULL, NULL, NULL);
 			data->hWndPaletteSelect = CreateWindowEx(WS_EX_CLIENTEDGE, WC_LISTBOX, L"", WS_VISIBLE | WS_CHILD | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | LBS_NOTIFY, 0, 100, 150, 100, hWnd, NULL, NULL, NULL);
-			data->hWndExportAll = CreateWindow(L"BUTTON", L"Export all", WS_VISIBLE | WS_CHILD, 0, 300 - 22, 150, 22, hWnd, NULL, NULL, NULL);
-			data->hWndReplaceButton = CreateWindow(L"BUTTON", L"Replace", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 150, 300 - 22, 100, 22, hWnd, NULL, NULL, NULL);
+			data->hWndExportAll = CreateButton(hWnd, L"Export All", 0, 300 - 22, 75, 22, FALSE);
+			data->hWndResourceButton = CreateButton(hWnd, L"VRAM Use", 75, 300 - 22, 75, 22, FALSE);
+			data->hWndReplaceButton = CreateButton(hWnd, L"Replace", 150, 300 - 22, 100, 22, TRUE);
+			data->hWndAddButton = CreateButton(hWnd, L"Add", 250, 300 - 22, 100, 22, FALSE);
 			EnumChildWindows(hWnd, SetFontProc, (LPARAM) GetStockObject(DEFAULT_GUI_FONT));
+			SetWindowSubclass(data->hWndTextureSelect, ListboxDeleteSubclassProc, 1, 0);
+			SetWindowSubclass(data->hWndPaletteSelect, ListboxDeleteSubclassProc, 1, 0);
 			data->scale = 1;
 			return 1;
 		}
@@ -260,9 +275,11 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 		case NV_INITIALIZE:
 		{
 			LPWSTR path = (LPWSTR) wParam;
-			memcpy(data->szOpenFile, path, 2 * (wcslen(path) + 1));
+			if (path != NULL) {
+				memcpy(data->szOpenFile, path, 2 * (wcslen(path) + 1));
+				SendMessage(hWnd, NV_SETTITLE, 0, (LPARAM) path);
+			}
 			memcpy(&data->nsbtx, (NSBTX *) lParam, sizeof(NSBTX));
-			SendMessage(hWnd, NV_SETTITLE, 0, (LPARAM) path);
 
 			WCHAR buffer[17];
 			for (int i = 0; i < data->nsbtx.nTextures; i++) {
@@ -296,8 +313,20 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 			int p = SendMessage(data->hWndPaletteSelect, LB_GETCURSEL, 0, 0);
 			TEXELS *texture = data->nsbtx.textures + t;
 			PALETTE *palette = data->nsbtx.palettes + p;
-			HBITMAP hBitmap = renderTexture(texture, palette, data->scale);
+			if (t >= data->nsbtx.nTextures || t < 0) texture = NULL; //catch out-of-bounds cases
+			if (p >= data->nsbtx.nPalettes || p < 0) palette = NULL;
 
+			//if no texture, we can't really render anything
+			if (texture == NULL) {
+				EndPaint(hWnd, &ps);
+				return 0;
+			}
+			if (FORMAT(texture->texImageParam) != CT_DIRECT && palette == NULL) {
+				EndPaint(hWnd, &ps);
+				return 0;
+			}
+
+			HBITMAP hBitmap = renderTexture(texture, palette, data->scale);
 			HDC hCompat = CreateCompatibleDC(hDC);
 			SelectObject(hCompat, hBitmap);
 			BitBlt(hDC, 150, 22, TEXW(texture->texImageParam) * data->scale, TEXH(texture->texImageParam) * data->scale, hCompat, 0, 0, SRCCOPY);
@@ -321,6 +350,38 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 			DeleteObject(hCompat);
 			DeleteObject(hBitmap);
 			return 0;
+		}
+		case NV_CHILDNOTIF:
+		{
+			//if lParam is the texture or palette select, we're being notified of a deletion
+			HWND hWndControl = (HWND) lParam;
+			int sel = wParam;
+			if (hWndControl == data->hWndTextureSelect) {
+				//delete the sel-th texture
+				TEXELS *textures = data->nsbtx.textures;
+				void *texel = textures[sel].texel, *index = textures[sel].cmp;
+				memmove(textures + sel, textures + sel + 1, (data->nsbtx.nTextures - sel - 1) * sizeof(TEXELS));
+				data->nsbtx.nTextures--;
+				data->nsbtx.textures = (TEXELS *) realloc(data->nsbtx.textures, data->nsbtx.nTextures * sizeof(TEXELS));
+				//don't forget to free!
+				free(texel);
+				if (index) free(index);
+
+				//update index if it would be out of bounds
+				if (sel >= data->nsbtx.nTextures) sel = data->nsbtx.nTextures - 1;
+			} else if (hWndControl == data->hWndPaletteSelect) {
+				//delete the sel-th palette
+				PALETTE *palettes = data->nsbtx.palettes;
+				void *cols = palettes[sel].pal;
+				memmove(palettes + sel, palettes + sel + 1, (data->nsbtx.nPalettes - sel - 1) * sizeof(PALETTE));
+				data->nsbtx.nPalettes--;
+				data->nsbtx.palettes = (PALETTE *) realloc(data->nsbtx.palettes, data->nsbtx.nPalettes * sizeof(PALETTE));
+				free(cols);
+				if (sel >= data->nsbtx.nPalettes) sel = data->nsbtx.nPalettes - 1;
+			}
+			SendMessage(hWndControl, LB_SETCURSEL, sel, 0);
+			InvalidateRect(hWnd, NULL, TRUE);
+			break;
 		}
 		case WM_COMMAND:
 		{
@@ -407,10 +468,10 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 							PALETTE *destPal = data->nsbtx.palettes + selectedPalette;
 							int oldTexImageParam = destTex->texImageParam;
 							memcpy(texels.name, destTex->name, 16);
-							memcpy(palette.name, destPal->name, 16);
 							if (destTex->cmp) free(destTex->cmp);
 							memcpy(destTex, &texels, sizeof(TEXELS));
 							if (FORMAT(texels.texImageParam) != CT_DIRECT) {
+								memcpy(palette.name, destPal->name, 16);
 								free(destPal->pal);
 								memcpy(destPal, &palette, sizeof(PALETTE));
 							}
@@ -422,7 +483,6 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 						free(path);
 					} else if (hWndControl == data->hWndExportAll) {
-						CoInitialize(NULL); //required for SHBrowseForFolder
 						WCHAR path[MAX_PATH]; //we will overwrite this with the *real* path
 
 						BROWSEINFO bf;
@@ -437,7 +497,6 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 						PIDLIST_ABSOLUTE idl = SHBrowseForFolder(&bf);
 
 						if (idl == NULL) {
-							CoUninitialize();
 							break;
 						}
 						SHGetPathFromIDList(idl, path);
@@ -479,8 +538,137 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 							free(palNames[i]);
 						}
 						free(palNames);
+					} else if (hWndControl == data->hWndResourceButton) {
+						HWND hWndMain = getMainWindow(hWnd);
+						CreateVramUseWindow(hWndMain, &data->nsbtx);
+					} else if (hWndControl == data->hWndAddButton) {
+						LPWSTR path = openFileDialog(hWnd, L"Open Nitro TGA", L"TGA Files (*.tga)\0*.tga\0All Files\0*.*\0", L"tga");
+						if (!path) break;
 
-						CoUninitialize();
+						//read texture
+						TEXELS texels;
+						PALETTE palette;
+						int s = nitroTgaRead(path, &texels, &palette);
+						if (s) {
+							MessageBox(hWnd, L"Invalid Nitro TGA.", L"Invalid Nitro TGA", MB_ICONERROR);
+						} else {
+							//add
+							WCHAR strbuf[17] = { 0 };
+							int texImageParam = texels.texImageParam;
+							int fmt = FORMAT(texImageParam);
+							int hasPalette = fmt != CT_DIRECT;
+
+							//add texel
+							{
+								//update NSBTX
+								data->nsbtx.textures = realloc(data->nsbtx.textures, (data->nsbtx.nTextures + 1) * sizeof(TEXELS));
+								memcpy(data->nsbtx.textures + data->nsbtx.nTextures, &texels, sizeof(TEXELS));
+								data->nsbtx.nTextures++;
+
+								//update UI
+								for (int i = 0; i < 16; i++) {
+									strbuf[i] = (WCHAR) texels.name[i];
+								}
+								SendMessage(data->hWndTextureSelect, LB_ADDSTRING, 0, (LPARAM) strbuf);
+								SendMessage(data->hWndTextureSelect, LB_SETCURSEL, data->nsbtx.nTextures - 1, 0);
+							}
+
+							//add palette (if the name is the same as an existing palette, use the larger
+							//of the two palettes)
+							if (hasPalette) {
+								//check if a palette of that name already exists.
+								PALETTE *existing = NULL;
+								int existingIndex = -1;
+								for (int i = 0; i < data->nsbtx.nPalettes; i++) {
+									PALETTE *p = data->nsbtx.palettes + i;
+									if (memcmp(p->name, palette.name, 16) == 0) {
+										existing = data->nsbtx.palettes + i;
+										existingIndex = i;
+										break;
+									}
+								}
+
+								//existing?
+								PALETTE *dest = NULL;
+								int destIndex = -1;
+								if (existing != NULL) {
+									//if existing, ensure one is a subset of the other.
+									int nColsExisting = existing->nColors;
+									int nColsNew = palette.nColors;
+									int nColsCompare = min(nColsNew, nColsExisting);
+
+									//not a subset?
+									if (memcmp(palette.pal, existing->pal, nColsCompare * sizeof(COLOR)) != 0) {
+										MessageBox(hWnd, L"Palette name conflict.", L"Palette name conflict", MB_ICONERROR);
+										free(palette.pal);
+										break;
+									}
+									dest = existing;
+									destIndex = existingIndex;
+
+									//if new palette is larger, realloc
+									if (nColsNew > nColsExisting) {
+										dest->nColors = nColsNew;
+										free(dest->pal);
+										dest->pal = palette.pal;
+									} else {
+										free(palette.pal);
+									}
+								} else {
+									//increase palette count. Update NSBTX
+									data->nsbtx.palettes = realloc(data->nsbtx.palettes, (data->nsbtx.nPalettes + 1) * sizeof(PALETTE));
+									dest = data->nsbtx.palettes + data->nsbtx.nPalettes;
+									memcpy(dest, &palette, sizeof(PALETTE));
+									data->nsbtx.nPalettes++;
+
+									//add to UI
+									for (int i = 0; i < 16; i++) {
+										strbuf[i] = (WCHAR) palette.name[i];
+									}
+									SendMessage(data->hWndPaletteSelect, LB_ADDSTRING, 0, (LPARAM) strbuf);
+								}
+
+								//update UI
+								SendMessage(data->hWndPaletteSelect, LB_SETCURSEL, data->nsbtx.nPalettes - 1, 0);
+							}
+
+							//invalidate
+							InvalidateRect(hWnd, NULL, TRUE);
+						}
+
+						free(path);
+					}
+				} else if (m == LBN_DBLCLK) {
+					if (hWndControl == data->hWndTextureSelect || hWndControl == data->hWndPaletteSelect) {
+						WCHAR textBuffer[17] = { 0 }; //enforced: items <= 16 chars long
+						int sel = SendMessage(hWndControl, LB_GETCURSEL, 0, 0);
+						SendMessage(hWndControl, LB_GETTEXT, sel, (LPARAM) textBuffer);
+						
+						//make prompt
+						HWND hWndMain = getMainWindow(hWnd);
+						int n = PromptUserText(hWndMain, L"Name Entry", L"Enter a name:", textBuffer, 17);
+						if (n) {
+							//replace selected text
+							SendMessage(hWndControl, WM_SETREDRAW, FALSE, 0);
+							SendMessage(hWndControl, LB_DELETESTRING, sel, 0);
+							SendMessage(hWndControl, LB_INSERTSTRING, sel, (LPARAM) textBuffer);
+							SendMessage(hWndControl, WM_SETREDRAW, TRUE, 0);
+							RedrawWindow(hWndControl, NULL, NULL, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+							SendMessage(hWndControl, LB_SETCURSEL, sel, 0);
+							SetFocus(hWndControl);
+
+							//update NSBTX
+							char *destName = NULL;
+							if (hWndControl == data->hWndTextureSelect) {
+								destName = data->nsbtx.textures[sel].name;
+							} else {
+								destName = data->nsbtx.palettes[sel].name;
+							}
+							memset(destName, 0, 16);
+							for (unsigned int i = 0; i < wcslen(textBuffer); i++) {
+								destName[i] = (char) textBuffer[i];
+							}
+						}
 					}
 				}
 			}
@@ -493,8 +681,10 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 			int height = rcClient.bottom;
 			MoveWindow(data->hWndTextureSelect, 0, 0, 150, height / 2 - 11, TRUE);
 			MoveWindow(data->hWndPaletteSelect, 0, height / 2 - 11, 150, height / 2 - 11, TRUE);
-			MoveWindow(data->hWndExportAll, 0, height - 22, 150, 22, TRUE);
+			MoveWindow(data->hWndExportAll, 0, height - 22, 75, 22, TRUE);
+			MoveWindow(data->hWndResourceButton, 75, height - 22, 75, 22, TRUE);
 			MoveWindow(data->hWndReplaceButton, 150, height - 22, 100, 22, TRUE);
+			MoveWindow(data->hWndAddButton, 250, height - 22, 100, 22, TRUE);
 			break;
 		}
 		case WM_MDIACTIVATE:
@@ -524,25 +714,191 @@ LRESULT WINAPI NsbtxViewerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 		case WM_DESTROY:
 		{
 			NSBTX *nsbtx = &data->nsbtx;
+			fileFree((OBJECT_HEADER *) nsbtx);
+			break;
+		}
+		case NV_GETTYPE:
+			return FILE_TYPE_NSBTX;
+	}
+	return DefMDIChildProc(hWnd, msg, wParam, lParam);
+}
+
+void CreateVramUseWindow(HWND hWndParent, NSBTX *nsbtx) {
+	HWND hWndVramViewer = CreateWindow(L"VramUseClass", L"VRAM Usage", WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, CW_USEDEFAULT,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hWndParent, NULL, NULL, NULL);
+	SendMessage(hWndVramViewer, NV_INITIALIZE, 0, (LPARAM) nsbtx);
+	DoModal(hWndVramViewer);
+}
+
+LRESULT CALLBACK VramUseWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	HWND hWndTexLabel = (HWND) GetWindowLong(hWnd, 0 * sizeof(void *));
+	HWND hWndPalLabel = (HWND) GetWindowLong(hWnd, 1 * sizeof(void *));
+	HWND hWndTexList = (HWND) GetWindowLong(hWnd, 2 * sizeof(void *));
+	HWND hWndPalList = (HWND) GetWindowLong(hWnd, 3 * sizeof(void *));
+	HWND hWndInfoButton = (HWND) GetWindowLong(hWnd, 4 * sizeof(void *));
+
+	switch (msg) {
+		case WM_CREATE:
+		{
+			int width = 350 + GetSystemMetrics(SM_CXVSCROLL);
+			HWND hWndTextureLabel = CreateStatic(hWnd, L"Texture usage: %d.%03dKB (%d.%03dKB Texel, %d.%03dKB Index)", 5, 0, width - 5, 22);
+			HWND hWndButton = CreateButton(hWnd, L"...", width - 25, 0, 25, 22, FALSE);
+
+			HWND hWndTextures = CreateListView(hWnd, 0, 22, width, 150);
+			AddListViewColumn(hWndTextures, L"Texture", 0, 125, SCA_LEFT);
+			AddListViewColumn(hWndTextures, L"Format", 1, 75, SCA_LEFT);
+			AddListViewColumn(hWndTextures, L"Texel (KB)", 2, 75, SCA_RIGHT);
+			AddListViewColumn(hWndTextures, L"Index (KB)", 3, 75, SCA_RIGHT);
+
+			HWND hWndPaletteLabel = CreateStatic(hWnd, L"Palette usage: 0KB", 5, 22 + 150, width - 5, 22);
+
+			HWND hWndPalettes = CreateListView(hWnd, 0, 22 + 22 + 150, width, 150);
+			AddListViewColumn(hWndPalettes, L"Palette", 0, 125, SCA_LEFT);
+			AddListViewColumn(hWndPalettes, L"Colors", 1, 75, SCA_RIGHT);
+			AddListViewColumn(hWndPalettes, L"Size (KB)", 2, 75, SCA_RIGHT);
+			SetWindowSize(hWnd, width, 300 + 22 + 22);
+			EnumChildWindows(hWnd, SetFontProc, (LPARAM) (HFONT) GetStockObject(DEFAULT_GUI_FONT));
+
+			SetWindowLong(hWnd, 0 * sizeof(void *), (LONG) hWndTextureLabel);
+			SetWindowLong(hWnd, 1 * sizeof(void *), (LONG) hWndPaletteLabel);
+			SetWindowLong(hWnd, 2 * sizeof(void *), (LONG) hWndTextures);
+			SetWindowLong(hWnd, 3 * sizeof(void *), (LONG) hWndPalettes);
+			SetWindowLong(hWnd, 4 * sizeof(void *), (LONG) hWndButton);
+			break;
+		}
+		case NV_INITIALIZE:
+		{
+			NSBTX *nsbtx = (NSBTX *) lParam;
+
+			//for all textures...
+			int nTextures = 0, nPalettes = 0;
+			int totalTexelSize = 0, totalIndexSize = 0, totalPaletteSize = 0, totalTextureSize = 0;
+			int compressedTexelSize = 0, normalTexelSize = 0;
+			WCHAR textBuffer[256];
 			for (int i = 0; i < nsbtx->nTextures; i++) {
-				free(nsbtx->textures[i].texel);
-				if (nsbtx->textures[i].cmp) free(nsbtx->textures[i].cmp);
+				TEXELS *tex = nsbtx->textures + i;
+				int texImageParam = tex->texImageParam;
+				int format = FORMAT(texImageParam);
+				int texelSize = getTexelSize(TEXW(texImageParam), TEXH(texImageParam), texImageParam);
+				int indexSize = getIndexVramSize(tex);
+
+				//copy name. Beware, not null terminated
+				for (unsigned int j = 0; j < 16; j++) {
+					textBuffer[j] = (WCHAR) tex->name[j];
+					textBuffer[j + 1] = L'\0';
+				}
+				AddListViewItem(hWndTexList, textBuffer, i, 0);
+
+				//format
+				const char *fmt = stringFromFormat(FORMAT(texImageParam));
+				for (unsigned int j = 0; j < strlen(fmt); j++) {
+					textBuffer[j] = (WCHAR) fmt[j];
+					textBuffer[j + 1] = L'\0';
+				}
+				AddListViewItem(hWndTexList, textBuffer, i, 1);
+
+				//sizes
+				wsprintfW(textBuffer, L"%d.%03d", texelSize / 1024, (texelSize % 1024) * 1000 / 1024);
+				AddListViewItem(hWndTexList, textBuffer, i, 2);
+				if (indexSize) {
+					wsprintfW(textBuffer, L"%d.%03d", indexSize / 1024, (indexSize % 1024) * 1000 / 1024);
+					AddListViewItem(hWndTexList, textBuffer, i, 3);
+				}
+
+				nTextures++;
+				totalTexelSize += texelSize;
+				totalIndexSize += indexSize;
+				totalTextureSize += texelSize + indexSize;
+				if (format == CT_4x4) compressedTexelSize += texelSize;
+				else normalTexelSize += texelSize;
 			}
+
+			//all palettes...
 			for (int i = 0; i < nsbtx->nPalettes; i++) {
-				free(nsbtx->palettes[i].pal);
+				PALETTE *pal = nsbtx->palettes + i;
+				int nCols = pal->nColors;
+				int paletteSize = nCols * 2;
+
+				//copy name. Beware, not null terminated
+				for (unsigned int j = 0; j < 16; j++) {
+					textBuffer[j] = (WCHAR) pal->name[j];
+					textBuffer[j + 1] = L'\0';
+				}
+				AddListViewItem(hWndPalList, textBuffer, i, 0);
+
+				//colors and size
+				wsprintfW(textBuffer, L"%d", pal->nColors);
+				AddListViewItem(hWndPalList, textBuffer, i, 1);
+				wsprintfW(textBuffer, L"%d.%03d", paletteSize / 1024, (paletteSize % 1024) * 1000 / 1024);
+				AddListViewItem(hWndPalList, textBuffer, i, 2);
+
+				totalPaletteSize += paletteSize;
 			}
-			if (nsbtx->mdl0 != NULL) {
-				free(nsbtx->mdl0);
+
+			//label text
+			int len = wsprintfW(textBuffer, L"Texture usage: %d.%03dKB (%d.%03dKB Texel, %d.%03dKB Index)",
+				totalTextureSize / 1024, (totalTextureSize % 1024) * 1000 / 1024,
+				totalTexelSize / 1024, (totalTexelSize % 1024) * 1000 / 1024,
+				totalIndexSize / 1024, (totalIndexSize % 1024) * 1000 / 1024);
+			SendMessage(hWndTexLabel, WM_SETTEXT, len, (LPARAM) textBuffer);
+			len = wsprintfW(textBuffer, L"Palette usage: %d.%03dKB",
+				totalPaletteSize / 1024, (totalPaletteSize % 1024) * 1000 / 1024);
+			SendMessage(hWndPalLabel, WM_SETTEXT, len, (LPARAM) textBuffer);
+
+			//set info fields
+			SetWindowLong(hWnd, 5 * sizeof(void *), (LONG) normalTexelSize);
+			SetWindowLong(hWnd, 6 * sizeof(void *), (LONG) compressedTexelSize);
+			SetWindowLong(hWnd, 7 * sizeof(void *), (LONG) totalIndexSize);
+			break;
+		}
+		case WM_COMMAND:
+		{
+			HWND hWndControl = (HWND) lParam;
+			if (hWndControl != NULL) {
+				if (hWndControl == hWndInfoButton && HIWORD(wParam) == BN_CLICKED) {
+					WCHAR buffer[128];
+					int normalTexelSize = GetWindowLong(hWnd, 5 * sizeof(void *));
+					int compressedTexelSize = GetWindowLong(hWnd, 6 * sizeof(void *));
+					int totalIndexSize = GetWindowLong(hWnd, 7 * sizeof(void *));
+					wsprintfW(buffer, L"Texture Summary:\nNormal Texel:\t\t%d.%03dKB\nCompressed Texel:\t\t%d.%03dKB\nIndex Data:\t\t%d.%03dKB",
+						normalTexelSize / 1024, (normalTexelSize % 1024) * 1000 / 1024,
+						compressedTexelSize / 1024, (compressedTexelSize % 1024) * 1000 / 1024,
+						totalIndexSize / 1024, (totalIndexSize % 1024) * 1000 / 1024);
+					MessageBox(hWnd, buffer, L"Texture VRAM Usage", MB_ICONINFORMATION);
+				}
 			}
-			free(nsbtx->textureDictionary.entry.data);
-			free(nsbtx->paletteDictionary.entry.data);
-			free(nsbtx->palettes);
-			free(nsbtx->textures);
-			free(data);
+			break;
+		}
+		case WM_SIZE:
+		{
+			RECT rcClient;
+			GetClientRect(hWnd, &rcClient);
+			int width = rcClient.right, height = rcClient.bottom;
+
+			int listViewHeight = (height - (22 * 2)) / 2;
+			MoveWindow(hWndInfoButton, width - 25, 0, 25, 22, TRUE);
+			MoveWindow(hWndTexList, 0, 22, width, listViewHeight, TRUE);
+			MoveWindow(hWndPalLabel, 5, 22 + listViewHeight, width - 5, 22, FALSE);
+			MoveWindow(hWndPalList, 0, 44 + listViewHeight, width, height - (44 + listViewHeight), TRUE);
 			break;
 		}
 	}
-	return DefMDIChildProc(hWnd, msg, wParam, lParam);
+	return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+VOID RegisterVramUseClass(VOID) {
+	WNDCLASSEX wcex = { 0 };
+	wcex.cbSize = sizeof(wcex);
+	wcex.style = CS_HREDRAW | CS_VREDRAW;
+	wcex.hbrBackground = g_useDarkTheme ? CreateSolidBrush(RGB(32, 32, 32)) : (HBRUSH) COLOR_WINDOW;
+	wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wcex.lpszClassName = L"VramUseClass";
+	wcex.lpfnWndProc = VramUseWndProc;
+	wcex.cbWndExtra = 8 * sizeof(void *); //2 labels, 2 ListViews, info button
+	                                      //texel size, 4x4 texel size, index size
+	wcex.hIcon = g_appIcon;
+	wcex.hIconSm = g_appIcon;
+	RegisterClassEx(&wcex);
 }
 
 VOID RegisterNsbtxViewerClass(VOID) {
@@ -557,6 +913,7 @@ VOID RegisterNsbtxViewerClass(VOID) {
 	wcex.hIcon = g_appIcon;
 	wcex.hIconSm = g_appIcon;
 	RegisterClassEx(&wcex);
+	RegisterVramUseClass();
 }
 
 HWND CreateNsbtxViewer(int x, int y, int width, int height, HWND hWndParent, LPCWSTR path) {
@@ -569,5 +926,11 @@ HWND CreateNsbtxViewer(int x, int y, int width, int height, HWND hWndParent, LPC
 
 	HWND h = CreateWindowEx(WS_EX_CLIENTEDGE | WS_EX_MDICHILD, L"NsbtxViewerClass", L"NSBTX Editor", WS_VISIBLE | WS_CLIPSIBLINGS | WS_CAPTION | WS_CLIPCHILDREN, x, y, width, height, hWndParent, NULL, NULL, NULL);
 	SendMessage(h, NV_INITIALIZE, (WPARAM) path, (LPARAM) &nsbtx);
+	return h;
+}
+
+HWND CreateNsbtxViewerImmediate(int x, int y, int width, int height, HWND hWndParent, NSBTX *nsbtx) {
+	HWND h = CreateWindowEx(WS_EX_CLIENTEDGE | WS_EX_MDICHILD, L"NsbtxViewerClass", L"NSBTX Editor", WS_VISIBLE | WS_CLIPSIBLINGS | WS_CAPTION | WS_CLIPCHILDREN, x, y, width, height, hWndParent, NULL, NULL, NULL);
+	SendMessage(h, NV_INITIALIZE, (WPARAM) NULL, (LPARAM) nsbtx);
 	return h;
 }

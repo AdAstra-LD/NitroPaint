@@ -9,6 +9,30 @@ int getTexelSize(int width, int height, int texImageParam) {
 	return (nPx * b) >> 3;
 }
 
+int getIndexVramSize(TEXELS *texels) {
+	int texImageParam = texels->texImageParam;
+	int format = FORMAT(texImageParam);
+	int hasIndex = format == CT_4x4;
+
+	int texelSize = getTexelSize(TEXW(texImageParam), TEXH(texImageParam), texImageParam);
+	int indexSize = hasIndex ? (texelSize / 2) : 0;
+	return indexSize;
+}
+
+int getTextureVramSize(TEXELS *texels) {
+	int texImageParam = texels->texImageParam;
+	int w = TEXW(texImageParam);
+	int h = TEXH(texImageParam);
+	int fmt = FORMAT(texImageParam);
+
+	int bpps[] = { 0, 8, 2, 4, 8, 3, 8, 16 };
+	return bpps[fmt] * w * h / 8;
+}
+
+int getPaletteVramSize(PALETTE *palette) {
+	return palette->nColors * sizeof(COLOR);
+}
+
 typedef struct {
 	BYTE r;
 	BYTE g;
@@ -39,7 +63,7 @@ char *stringFromFormat(int fmt) {
 	return fmts[fmt];
 }
 
-void convertTexture(DWORD *px, TEXELS *texels, PALETTE *palette, int flip) {
+void textureRender(DWORD *px, TEXELS *texels, PALETTE *palette, int flip) {
 	int format = FORMAT(texels->texImageParam);
 	int c0xp = COL0TRANS(texels->texImageParam);
 	int width = TEXW(texels->texImageParam);
@@ -151,56 +175,72 @@ void convertTexture(DWORD *px, TEXELS *texels, PALETTE *palette, int flip) {
 		case CT_4x4:
 		{
 			int squares = (width * height) >> 4;
-			RGB colors[4] = { 0 };
 			RGB transparent = {0, 0, 0, 0};
 			for(int i = 0; i < squares; i++){
+				RGB colors[4] = { 0 };
 				unsigned texel = *(unsigned *) (texels->texel + (i << 2));
 				unsigned short data = *(unsigned short *) (texels->cmp + i);
 
-				int address = (data & 0x3FFF) << 1;
-				int mode = (data >> 14) & 0x3;
-				if (address < palette->nColors) {
-					unsigned short * base = ((unsigned short *) palette->pal) + address;
+				int address = COMP_INDEX(data);
+				int mode = (data & COMP_MODE_MASK) >> 14;
+				COLOR *base = ((COLOR *) palette->pal) + address;
+				if (address + 2 <= palette->nColors) {
 					getrgb(base[0], colors);
 					getrgb(base[1], colors + 1);
-					colors[0].a = 255;
-					colors[1].a = 255;
-					if (mode == 0) {
+				}
+				colors[0].a = 255;
+				colors[1].a = 255;
+				if (mode == 0) {
+					//require 3 colors
+					if (address + 3 <= palette->nColors) {
 						getrgb(base[2], colors + 2);
-						colors[2].a = 255;
-						colors[3] = transparent;
-					} else if (mode == 1) {
-						RGB col0 = *colors;
-						RGB col1 = *(colors + 1);
-						colors[2].r = (col0.r + col1.r) >> 1;
-						colors[2].g = (col0.g + col1.g) >> 1;
-						colors[2].b = (col0.b + col1.b) >> 1;
-						colors[2].a = 255;
-						colors[3] = transparent;
-					} else if (mode == 2) {
+					}
+					colors[2].a = 255;
+					colors[3] = transparent;
+				} else if (mode == 1) {
+					//require 2 colors
+					RGB col0 = { 0, 0, 0, 255 };
+					RGB col1 = { 0, 0, 0, 255 };
+					if (address + 2 <= palette->nColors) {
+						col0 = *colors;
+						col1 = *(colors + 1);
+					}
+					colors[2].r = (col0.r + col1.r + 1) >> 1;
+					colors[2].g = (col0.g + col1.g + 1) >> 1;
+					colors[2].b = (col0.b + col1.b + 1) >> 1;
+					colors[2].a = 255;
+					colors[3] = transparent;
+				} else if (mode == 2) {
+					//require 4 colors
+					if (address + 4 <= palette->nColors) {
 						getrgb(base[2], colors + 2);
 						getrgb(base[3], colors + 3);
-						colors[2].a = 255;
-						colors[3].a = 255;
-					} else {
-						RGB col0 = *colors;
-						RGB col1 = *(colors + 1);
-						colors[2].r = (col0.r * 5 + col1.r * 3) >> 3;
-						colors[2].g = (col0.g * 5 + col1.g * 3) >> 3;
-						colors[2].b = (col0.b * 5 + col1.b * 3) >> 3;
-						colors[2].a = 255;
-						colors[3].r = (col0.r * 3 + col1.r * 5) >> 3;
-						colors[3].g = (col0.g * 3 + col1.g * 5) >> 3;
-						colors[3].b = (col0.b * 3 + col1.b * 5) >> 3;
-						colors[3].a = 255;
 					}
+					colors[2].a = 255;
+					colors[3].a = 255;
+				} else {
+					//require 2 colors
+					RGB col0 = { 0, 0, 0, 255 };
+					RGB col1 = { 0, 0, 0, 255 };
+					if (address + 2 <= palette->nColors) {
+						col0 = *colors;
+						col1 = *(colors + 1);
+					}
+					colors[2].r = (col0.r * 5 + col1.r * 3 + 4) >> 3;
+					colors[2].g = (col0.g * 5 + col1.g * 3 + 4) >> 3;
+					colors[2].b = (col0.b * 5 + col1.b * 3 + 4) >> 3;
+					colors[2].a = 255;
+					colors[3].r = (col0.r * 3 + col1.r * 5 + 4) >> 3;
+					colors[3].g = (col0.g * 3 + col1.g * 5 + 4) >> 3;
+					colors[3].b = (col0.b * 3 + col1.b * 5 + 4) >> 3;
+					colors[3].a = 255;
 				}
 				for(int j = 0; j < 16; j++){
 					int pVal = texel & 0x3;
 					texel >>= 2;
 					RGB rgb = colors[pVal];
 					int offs = ((i & ((width >> 2) - 1)) << 2) + (j & 3) + (((i / (width >> 2)) << 2) + (j  >> 2)) * width;
-					px[offs] = rgb.b | (rgb.g << 8) | (rgb.r << 16) | (rgb.a << 24);
+					px[offs] = ColorRoundToDS18(rgb.b | (rgb.g << 8) | (rgb.r << 16)) | (rgb.a << 24);
 				}
 			}
 			break;
@@ -241,79 +281,123 @@ void getVersion(char *buffer, int max) {
 	}
 }
 
+void nnsTgaWriteSection(HANDLE hFile, const char *section, const void *data, int size) {
+	DWORD dwWritten;
+	
+	//prepare and write
+	unsigned char header[0xC] = { 0 };
+	uint32_t dataSize = size == -1 ? strlen((const char *) data) : size;
+	memcpy(header, section, 8);
+	*(uint32_t *) (header + 0x8) = dataSize + sizeof(header);
+	WriteFile(hFile, header, sizeof(header), &dwWritten, NULL);
+	if (dataSize) {
+		WriteFile(hFile, data, dataSize, &dwWritten, NULL);
+	}
+}
+
+int imageHasTransparent(COLOR32 *px, int nPx) {
+	for (int i = 0; i < nPx; i++) {
+		COLOR32 c = px[i];
+		int a = c >> 24;
+		if (a < 255) return 1; //transparent/translucent pixel
+	}
+	return 0;
+}
+
+void nnsTgaWritePixels(HANDLE hFile, COLOR32 *rawPx, int width, int height, int depth) {
+	DWORD dwWritten;
+	if (depth == 32) {
+		//write as-is
+		WriteFile(hFile, rawPx, width * height * sizeof(COLOR32), &dwWritten, NULL);
+		return;
+	} else if (depth == 24) {
+		//convert to 24-bit
+		uint8_t *buffer = (uint8_t *) calloc(width * height, 3);
+		for (int i = 0; i < width * height; i++) {
+			COLOR32 c = rawPx[i];
+			uint8_t *pixel = buffer + i * 3;
+			pixel[0] = (c >> 0) & 0xFF;
+			pixel[1] = (c >> 8) & 0xFF;
+			pixel[2] = (c >> 16) & 0xFF;
+		}
+		WriteFile(hFile, buffer, width * height * 3, &dwWritten, NULL);
+		free(buffer);
+		return;
+	}
+	//bad
+}
+
 void writeNitroTGA(LPWSTR name, TEXELS *texels, PALETTE *palette) {
 	HANDLE hFile = CreateFile(name, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	DWORD dwWritten;
 
 	int width = TEXW(texels->texImageParam);
 	int height = TEXH(texels->texImageParam);
-	DWORD *pixels = (DWORD *) calloc(width * height, 4);
-	convertTexture(pixels, texels, palette, 1);
+	COLOR32 *pixels = (COLOR32 *) calloc(width * height, 4);
+	textureRender(pixels, texels, palette, 1);
+	int depth = imageHasTransparent(pixels, width * height) ? 32 : 24;
 
-	BYTE header[] = {0x14, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 8,
+	uint8_t header[] = {0x14, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 8,
 		'N', 'N', 'S', '_', 'T', 'g', 'a', ' ', 'V', 'e', 'r', ' ', '1', '.', '0', 0, 0, 0, 0, 0};
-	*(WORD *) (header + 0xC) = width;
-	*(WORD *) (header + 0xE) = height;
-	*(DWORD *) (header + 0x22) = sizeof(header) + width * height * 4;
+	*(uint16_t *) (header + 0x0C) = width;
+	*(uint16_t *) (header + 0x0E) = height;
+	*(uint8_t *) (header + 0x10) = depth;
+	*(uint32_t *) (header + 0x22) = sizeof(header) + width * height * (depth / 8);
 	WriteFile(hFile, header, sizeof(header), &dwWritten, NULL);
-	WriteFile(hFile, pixels, width * height * 4, &dwWritten, NULL);
+	nnsTgaWritePixels(hFile, pixels, width, height, depth);
 
+	//format
 	char *fstr = stringFromFormat(FORMAT(texels->texImageParam));
-	WriteFile(hFile, "nns_frmt", 8, &dwWritten, NULL);
-	int flen = strlen(fstr) + 0xC;
-	WriteFile(hFile, &flen, 4, &dwWritten, NULL);
-	WriteFile(hFile, fstr, flen - 0xC, &dwWritten, NULL);
+	nnsTgaWriteSection(hFile, "nns_frmt", fstr, -1);
 
 	//texels
-	WriteFile(hFile, "nns_txel", 8, &dwWritten, NULL);
-	DWORD txelLength = getTexelSize(width, height, texels->texImageParam) + 0xC;
-	WriteFile(hFile, &txelLength, 4, &dwWritten, NULL);
-	WriteFile(hFile, texels->texel, txelLength - 0xC, &dwWritten, NULL);
+	int txelLength = getTexelSize(width, height, texels->texImageParam);
+	nnsTgaWriteSection(hFile, "nns_txel", texels->texel, txelLength);
 
 	//write 4x4 if applicable
 	if (FORMAT(texels->texImageParam) == CT_4x4) {
-		WriteFile(hFile, "nns_pidx", 8, &dwWritten, NULL);
-		DWORD pidxLength = (txelLength - 0xC) / 2 + 0xC;
-		WriteFile(hFile, &pidxLength, 4, &dwWritten, NULL);
-		WriteFile(hFile, texels->cmp, pidxLength - 0xC, &dwWritten, NULL);
+		int pidxLength = txelLength / 2;
+		nnsTgaWriteSection(hFile, "nns_pidx", texels->cmp, pidxLength);
 	}
 
 	//palette (if applicable)
 	if (FORMAT(texels->texImageParam) != CT_DIRECT) {
-		WriteFile(hFile, "nns_pnam", 8, &dwWritten, NULL);
-		DWORD pnamLength = max16Len(palette->name) + 0xC;
-		WriteFile(hFile, &pnamLength, 4, &dwWritten, NULL);
-		WriteFile(hFile, palette->name, pnamLength - 0xC, &dwWritten, NULL);
+		int pnamLength = max16Len(palette->name);
+		nnsTgaWriteSection(hFile, "nns_pnam", palette->name, pnamLength);
 
-		WriteFile(hFile, "nns_pcol", 8, &dwWritten, NULL);
-		DWORD pcolLength = palette->nColors * 2 + 0xC;
-		WriteFile(hFile, &pcolLength, 4, &dwWritten, NULL);
-		WriteFile(hFile, palette->pal, palette->nColors * 2, &dwWritten, NULL);
+		int nColors = palette->nColors;
+		if (FORMAT(texels->texImageParam) == CT_4COLOR && nColors > 4) nColors = 4;
+		if (nColors == 4 || (nColors % 8) == 0) {
+			//valid size
+			nnsTgaWriteSection(hFile, "nns_pcol", palette->pal, nColors * sizeof(COLOR));
+		} else {
+			//needs padding
+			int outPaletteSize = (nColors + 7) / 8 * 8;
+			if (nColors < 4) outPaletteSize = (nColors + 3) / 4 * 4;
+
+			COLOR *padded = (COLOR *) calloc(outPaletteSize, sizeof(COLOR));
+			memcpy(padded, palette->pal, palette->nColors * sizeof(COLOR));
+			nnsTgaWriteSection(hFile, "nns_pcol", padded, outPaletteSize * sizeof(COLOR));
+			free(padded);
+		}
 	}
 
-	BYTE gnam[] = {'n', 'n', 's', '_', 'g', 'n', 'a', 'm', 22, 0, 0, 0, 'N', 'i', 't', 'r', 'o', 'P', 'a', 'i', 'n', 't'};
-	WriteFile(hFile, gnam, sizeof(gnam), &dwWritten, NULL);
-
+	//NitroPaint generator signature
 	char version[16];
 	getVersion(version, 16);
-	BYTE gver[] = {'n', 'n', 's', '_', 'g', 'v', 'e', 'r', 0, 0, 0, 0};
-	*(DWORD *) (gver + 8) = strlen(version) + 0xC;
-	WriteFile(hFile, gver, sizeof(gver), &dwWritten, NULL);
-	WriteFile(hFile, version, strlen(version), &dwWritten, NULL);
+	nnsTgaWriteSection(hFile, "nns_gnam", "NitroPaint", -1);
+	nnsTgaWriteSection(hFile, "nns_gver", version, -1);
 
-	BYTE imst[] = {'n', 'n', 's', '_', 'i', 'm', 's', 't', 0xC, 0, 0, 0};
-	WriteFile(hFile, imst, sizeof(imst), &dwWritten, NULL);
+	//dummy imagestudio data
+	nnsTgaWriteSection(hFile, "nns_imst", NULL, 0);
 
 	//if c0xp
 	if (COL0TRANS(texels->texImageParam)) {
-		BYTE c0xp[] = {'n', 'n', 's', '_', 'c', '0', 'x', 'p', 0xC, 0, 0, 0};
-		WriteFile(hFile, c0xp, sizeof(c0xp), &dwWritten, NULL);
+		nnsTgaWriteSection(hFile, "nns_c0xp", NULL, 0);
 	}
 
 	//write end
-	BYTE end[] = {'n', 'n', 's', '_', 'e', 'n', 'd', 'b', 0xC, 0, 0, 0};
-	WriteFile(hFile, end, sizeof(end), &dwWritten, NULL);
-
+	nnsTgaWriteSection(hFile, "nns_endb", NULL, 0);
 	CloseHandle(hFile);
 	free(pixels);
 }
@@ -450,14 +534,26 @@ int nitroTgaRead(LPWSTR path, TEXELS *texels, PALETTE *palette) {
 	}
 	texels->cmp = (short *) pidx;
 	texels->texel = txel;
-	memcpy(texels->name, pnam, 16);
 	int texImageParam = 0;
 	if (c0xp) texImageParam |= (1 << 29);
 	texImageParam |= (1 << 17) | (1 << 16);
 	texImageParam |= (ilog2(width >> 3) << 20) | (ilog2(height >> 3) << 23);
 	texImageParam |= frmt << 26;
-
 	texels->texImageParam = texImageParam;
 
+	//copy texture name
+	int nameOffset = 0;
+	for (unsigned int i = 0; i < wcslen(path); i++) {
+		if (path[i] == L'/' || path[i] == L'\\') nameOffset = i + 1;
+	}
+	LPWSTR name = path + nameOffset;
+	memset(texels->name, 0, 16);
+	for (unsigned int i = 0; i <= wcslen(name); i++) { //copy up to including null terminator
+		if (i == 16) break;
+		if (name[i] == L'.') break;
+		texels->name[i] = (char) name[i];
+	}
+
+	free(lpBuffer);
 	return 0;
 }

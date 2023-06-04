@@ -2,12 +2,11 @@
 
 #include "color.h"
 
-typedef struct RGB_ {
-	uint8_t r;
-	uint8_t g;
-	uint8_t b;
-	uint8_t a;
-} RGB;
+#define BALANCE_DEFAULT  20
+#define BALANCE_MIN      1
+#define BALANCE_MAX      39
+
+#define RECLUSTER_DEFAULT 8
 
 //
 // Comparator for use with qsort, sortrs an array of colors by lightness.
@@ -37,7 +36,7 @@ void createPalette_(COLOR32 *img, int width, int height, COLOR32 *pal, int nColo
 //
 // Finds the closest color in a palette to the specified color, optionally writing out the error.
 //
-int closestpalette(RGB rgb, RGB *palette, int paletteSize, RGB *error);
+int closestPalette(COLOR32 rgb, COLOR32 *palette, int paletteSize);
 
 //
 // Apply Floyd-Steinberg dithering to a pixel's surroundings.
@@ -50,19 +49,32 @@ void doDiffuse(int i, int width, int height, unsigned int * pixels, int errorRed
 void ditherImagePalette(COLOR32 *img, int width, int height, COLOR32 *palette, int nColors, int touchAlpha, int binaryAlpha, int c0xp, float diffuse);
 
 //
+// Apply dithering to a whole image using adaptive error diffusion, while
+// allowing use of specific balance settings.
+//
+void ditherImagePaletteEx(COLOR32 *img, int *indices, int width, int height, COLOR32 *palette, int nColors, int touchAlpha, int binaryAlpha, int c0xp, float diffuse, int balance, int colorBalance, int enhanceColors);
+
+//
 // Calculate the average color from a list of colors
 //
 COLOR32 averageColor(COLOR32 *cols, int nColors);
 
 //
-// Computes total squared error for a palette being applied to an image.
+// Computes the total squared error for a palette being applied to an image.
 //
-unsigned int getPaletteError(RGB *px, int nPx, RGB *pal, int paletteSize);
+unsigned int getPaletteError(COLOR32 *px, int nPx, COLOR32 *pal, int paletteSize);
 
 //
 // Creates multiple palettes for an image for character map color reduction.
 //
 void createMultiplePalettes(COLOR32 *imgBits, int tilesX, int tilesY, COLOR32 *dest, int paletteBase, int nPalettes, int paletteSize, int nColsPerPalette, int paletteOffset, int *progress);
+
+
+//
+// Creates multiple palettes for an image for character map color reduction
+// with user-provided balance, color balance, and color enhancement settings.
+//
+void createMultiplePalettesEx(COLOR32 *imgBits, int tilesX, int tilesY, COLOR32 *dest, int paletteBase, int nPalettes, int paletteSize, int nColsPerPalette, int paletteOffset, int balance, int colorBalance, int enhanceColors, int *progress);
 
 //
 // Convert an RGB color to YUV space.
@@ -96,6 +108,7 @@ typedef struct HIST_ENTRY_ {
 	int q;
 	int a;
 	struct HIST_ENTRY_ *next;
+	int entry;
 	double weight;
 	double value;
 } HIST_ENTRY;
@@ -128,7 +141,18 @@ typedef struct HISTOGRAM_ {
 	ALLOCATOR allocator;
 	HIST_ENTRY *entries[0x20000];
 	int nEntries;
+	int firstSlot;
 } HISTOGRAM;
+
+//struct for totaling a bucket in reclustering
+typedef struct {
+	double y;
+	double i;
+	double q;
+	double a;
+	double weight;
+	double error;
+} TOTAL_BUFFER;
 
 //reduction workspace structure
 typedef struct REDUCTION_ {
@@ -138,13 +162,18 @@ typedef struct REDUCTION_ {
 	int iWeight;
 	int qWeight;
 	int enhanceColors;
+	int nReclusters;
 	int maskColors;
 	int optimization;
 	HISTOGRAM *histogram;
 	HIST_ENTRY **histogramFlat;
+	TOTAL_BUFFER blockTotals[256];
 	COLOR_NODE *colorTreeHead;
 	COLOR_NODE *colorBlocks[0x2000];
 	uint8_t paletteRgb[256][3];
+	uint8_t paletteRgbCopy[256][3];
+	int paletteYiq[256][4];
+	int paletteYiqCopy[256][4];
 	double lumaTable[512];
 	double gamma;
 } REDUCTION;
@@ -175,6 +204,11 @@ void histogramAddColor(HISTOGRAM *histogram, int y, int i, int q, int a, double 
 void computeHistogram(REDUCTION *reduction, COLOR32 *img, int width, int height);
 
 //
+// Sort a histogram's colors by their principal component.
+//
+void sortHistogram(REDUCTION *reduction, int startIndex, int endIndex);
+
+//
 // Clears out a REDUCTION's histogram. Can be used to create multiple palettes.
 //
 void resetHistogram(REDUCTION *reduction);
@@ -190,10 +224,25 @@ void flattenHistogram(REDUCTION *reduction);
 void optimizePalette(REDUCTION *reduction);
 
 //
-// Flatten's a REDUCTION's palette into an array of RGB colors. Do this once
-// the palette is optimized.
+// Find the closest YIQA color to a specified YIQA color with a provided
+// reduction context.
 //
-void paletteToArray(REDUCTION *reduction);
+int closestPaletteYiq(REDUCTION *reduction, int *yiqColor, int *palette, int nColors);
+
+//
+// Compute palette error on a bitmap given a specified reduction context.
+//
+double computePaletteErrorYiq(REDUCTION *reduction, COLOR32 *px, int nPx, COLOR32 *pal, int nColors, int alphaThreshold, double nMaxError);
+
+//
+// Compute palette error on a histogram.
+//
+double computeHistogramPaletteError(REDUCTION *reduction, COLOR32 *palette, int nColors, double maxError);
+
+//
+// Compute palette error on a histogram for a YIQ palette.
+//
+double computeHistogramPaletteErrorYiq(REDUCTION *reduction, int *yiqPalette, int nColors, double maxError);
 
 //
 // Free all resources consumed by a REDUCTION.
